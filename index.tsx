@@ -612,7 +612,7 @@ const fetchWithProxies = async (
  */
 const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit): Promise<Response> => {
     const REQUEST_TIMEOUT = 30000; // 30 seconds for potentially large uploads
-    const hasAuthHeader = options.headers && (options.headers as Record<string, string>)['Authorization'];
+    const hasAuthHeader = options.headers && (options.headers as Headers).get('Authorization');
 
     // If the request has an Authorization header, it MUST be a direct request.
     // Proxies will strip authentication headers and cause a guaranteed failure.
@@ -2043,9 +2043,11 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
     useEffect(() => {
         if (item && item.generatedContent) {
             const isUpdate = !!item.originalUrl;
-            const generatedSlug = item.generatedContent.slug || item.title.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
-            const fullUrl = isUpdate ? item.originalUrl! : `${wpConfig.url.replace(/\/+$/, '')}/${generatedSlug}`;
-
+            // When updating, the slug should be the original full URL. When creating, it's base URL + slug.
+            const fullUrl = isUpdate 
+                ? item.originalUrl! 
+                : `${wpConfig.url.replace(/\/+$/, '')}/${item.generatedContent.slug}`;
+            
             setEditedSeo({
                 title: item.generatedContent.title,
                 metaDescription: item.generatedContent.metaDescription,
@@ -2058,6 +2060,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             setShowConfetti(false);
         }
     }, [item, wpConfig.url]);
+
 
     // SOTA Editor Logic
     useEffect(() => {
@@ -2160,7 +2163,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
     const handlePublishToWordPress = async () => {
         if (!wpConfig.url || !wpConfig.username || !wpPassword) {
             setWpPublishStatus('error');
-            setWpPublishMessage('Please fill in WordPress URL, Username, and Application Password in Step 2.');
+            setWpPublishMessage('Please fill in WordPress URL, Username, and Application Password in Step 1.');
             return;
         }
 
@@ -2171,12 +2174,17 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             ...item,
             generatedContent: {
                 ...item.generatedContent!,
-                ...editedSeo,
+                 // Use the edited SEO fields
+                title: editedSeo.title,
+                metaDescription: editedSeo.metaDescription,
+                // The slug for a *new* post is derived from the full URL.
+                // The publish function will handle extracting it.
+                slug: extractSlugFromUrl(editedSeo.slug),
                 content: editedContent,
             }
         };
 
-        const result = await publishItem(itemWithEdits, wpPassword, publishAction);
+        const result = await publishItem(itemWithEdits, wpPassword, item.originalUrl ? 'publish' : publishAction);
 
         if (result.success) {
             setWpPublishStatus('success');
@@ -3716,43 +3724,52 @@ const App = () => {
                     break;
                 }
 
-                // --- Generate REAL References (and place at the end) ---
+                // --- SOTA: Multi-layered Reference Generation ---
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Finding Real Sources...` } });
                 const contentSummaryForRefs = contentParts.join(' ').replace(/<[^>]+>/g, ' ').substring(0, 2000);
                 
                 let references: any[] | null = null;
+                let rawSearchResultsForFallback: any[] = [];
 
-                // --- STRATEGY 1: Use Serper API for high-quality, targeted search results ---
+                // STRATEGY 1: Iterative, targeted search with Serper API
                 if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
-                    try {
-                        console.log("Finding references using Serper API...");
-                        const serperQuery = `credible sources and studies for "${metaAndOutline.title}"`;
-                        const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
-                            method: 'POST',
-                            headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ q: serperQuery, num: 20 }) // Fetch 20 results for a better selection pool
-                        });
-                        if (!serperResponse.ok) throw new Error(`Serper API call failed with status ${serperResponse.status}`);
-                        
-                        const serperJson = await serperResponse.json();
-                        const searchResults = serperJson.organic ? serperJson.organic.slice(0, 15).map((r: any) => ({
-                            title: r.title,
-                            link: r.link,
-                            snippet: r.snippet
-                        })) : [];
+                    const searchQueries = [
+                        `academic research and studies on "${metaAndOutline.title}" filetype:pdf`,
+                        `"${metaAndOutline.primaryKeyword}" industry report OR analysis 2024 2025`,
+                        `in-depth guide "${metaAndOutline.title}" site:.edu OR site:.gov`,
+                    ];
 
-                        if (searchResults.length > 0) {
-                            const referencesText = await callAI('find_real_references_with_context', [metaAndOutline.title, contentSummaryForRefs, searchResults], 'json');
-                            references = JSON.parse(extractJson(referencesText));
-                        } else {
-                            console.warn("Serper returned no organic search results for references. Will try fallback.");
+                    for (const query of searchQueries) {
+                        if (references && references.length > 0) break;
+                        try {
+                            console.log(`[Reference Search] Attempting query: "${query}"`);
+                            const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
+                                method: 'POST',
+                                headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ q: query, num: 15 })
+                            });
+                            if (!serperResponse.ok) continue;
+
+                            const serperJson = await serperResponse.json();
+                            const searchResults = serperJson.organic ? serperJson.organic.map((r: any) => ({
+                                title: r.title, link: r.link, snippet: r.snippet
+                            })) : [];
+                            
+                            if (searchResults.length > 0) {
+                                rawSearchResultsForFallback.push(...searchResults);
+                                const referencesText = await callAI('find_real_references_with_context', [metaAndOutline.title, contentSummaryForRefs, searchResults], 'json');
+                                const parsedRefs = JSON.parse(extractJson(referencesText));
+                                if (parsedRefs && parsedRefs.length > 0) {
+                                    references = parsedRefs;
+                                }
+                            }
+                        } catch (serperError) {
+                            console.warn(`[Reference Search] Query failed. Trying next.`, serperError);
                         }
-                    } catch (serperError) {
-                        console.error("Failed to fetch references using Serper, falling back to Google Search grounding.", serperError);
                     }
                 }
-                
-                // --- STRATEGY 2 (FALLBACK): Use Gemini's built-in Google Search Grounding ---
+
+                // STRATEGY 2 (FALLBACK): Use Gemini's built-in Google Search Grounding
                 if (!references || references.length === 0) {
                     try {
                         console.log("Finding references using Gemini's Google Search grounding as a fallback...");
@@ -3763,6 +3780,7 @@ const App = () => {
                     }
                 }
                 
+                // --- FINAL DECISION & SOTA FALLBACK ---
                 if (references && Array.isArray(references) && references.length > 0) {
                     let referencesHtml = '<h2>References</h2>\n<ol>\n';
                     for (const ref of references) {
@@ -3777,14 +3795,29 @@ const App = () => {
                     referencesHtml += '</ol>';
                     contentParts.push(referencesHtml);
                 } else {
-                    console.error(`[Reference Generation] CRITICAL FAILURE: Could not find references for "${metaAndOutline.title}" using either Serper API or Google Search grounding. Inserting a manual action notice.`);
-                    const warningHtml = `
-                    <div class="manual-action-required-box error-box">
-                        <h3><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 1.2em; height: 1.2em; margin-right: 0.5em;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> Action Required: Add References</h3>
-                        <p>Our automated reference finder could not locate credible sources for this topic. To maintain the quality and credibility of this article, please manually research and add a list of 8-12 authoritative references in this section.</p>
-                    </div>
-                    `;
-                    contentParts.push(warningHtml);
+                    console.warn(`[Reference Generation] Automated extraction failed. Using SOTA fallback.`);
+                    const uniqueLinks = new Map();
+                    rawSearchResultsForFallback.forEach(r => { if (r.link && !uniqueLinks.has(r.link)) uniqueLinks.set(r.link, r); });
+                    const filteredResults = Array.from(uniqueLinks.values()).filter(r => 
+                        !['pinterest.com', 'youtube.com', 'facebook.com', 'twitter.com', 'forum', '.quora.com'].some(domain => r.link.includes(domain))
+                    ).slice(0, 10);
+                    
+                    if (filteredResults.length > 0) {
+                        let suggestedReadingHtml = `
+                        <div class="manual-action-required-box warning-box">
+                            <h3><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 1.2em; height: 1.2em; margin-right: 0.5em;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg> Suggested Reading &amp; Further Research</h3>
+                            <p>The following resources were automatically identified as highly relevant. Please review them for suitability as formal references and cite them where appropriate.</p>
+                            <ul>${filteredResults.map(r => `<li><a href="${r.link}" target="_blank" rel="noopener noreferrer">${r.title}</a></li>`).join('\n')}</ul>
+                        </div>`;
+                        contentParts.push(suggestedReadingHtml);
+                    } else {
+                        const originalWarningHtml = `
+                        <div class="manual-action-required-box error-box">
+                            <h3><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 1.2em; height: 1.2em; margin-right: 0.5em;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> Action Required: Add References</h3>
+                            <p>Our automated reference finder could not locate credible sources for this topic. Please manually research and add a list of 8-12 authoritative references in this section.</p>
+                        </div>`;
+                        contentParts.push(originalWarningHtml);
+                    }
                 }
 
                 let finalContent = contentParts.join('\n\n');
@@ -3872,6 +3905,121 @@ const App = () => {
         setIsGenerating(false);
 
     }, [apiClients, apiKeys, apiKeyStatus, callAI, existingPages, generateImageWithFallback, geoTargeting, openrouterModels, selectedGroqModel, selectedModel, siteInfo, useGoogleSearch, wpConfig]);
+    
+    const publishItemToWordPress = async (
+        itemToPublish: ContentItem,
+        currentWpPassword: string,
+        status: 'publish' | 'draft'
+    ): Promise<{ success: boolean; message: React.ReactNode; link?: string }> => {
+        const { generatedContent } = itemToPublish;
+        if (!generatedContent) {
+            return { success: false, message: 'No content to publish.' };
+        }
+
+        let contentWithWpImages = generatedContent.content;
+        let featuredImageId: number | null = null;
+        const base64ImageRegex = /<img[^>]+src="data:image\/(jpeg|png|webp);base64,([^"]+)"[^>]*>/g;
+        const imagesToUpload = [...contentWithWpImages.matchAll(base64ImageRegex)];
+
+        for (const [index, imageMatch] of imagesToUpload.entries()) {
+            const fullImgTag = imageMatch[0];
+            const mimeType = `image/${imageMatch[1]}`;
+            const base64Data = imageMatch[2];
+            const altText = fullImgTag.match(/alt="([^"]*)"/)?.[1] || generatedContent.title;
+            const imgTitle = fullImgTag.match(/title="([^"]*)"/)?.[1] || generatedContent.slug;
+
+            try {
+                const res = await fetch(`data:${mimeType};base64,${base64Data}`);
+                const blob = await res.blob();
+                const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
+                const headers = new Headers({
+                    'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
+                    'Content-Disposition': `attachment; filename="${imgTitle}-${index}.${imageMatch[1]}"`,
+                    'Content-Type': mimeType,
+                });
+
+                const uploadResponse = await fetchWordPressWithRetry(uploadUrl, { method: 'POST', headers, body: blob });
+                
+                if (!uploadResponse.ok) {
+                    const errorData = await uploadResponse.json().catch(() => ({ message: 'Unknown upload error' }));
+                    throw new Error(`Media upload failed: ${errorData.message}`);
+                }
+                
+                const mediaData = await uploadResponse.json();
+                const newImageUrl = mediaData.source_url;
+                const newImgTag = fullImgTag.replace(/src="[^"]+"/, `src="${newImageUrl}" class="wp-image-${mediaData.id}"`);
+                contentWithWpImages = contentWithWpImages.replace(fullImgTag, newImgTag);
+
+                if (index === 0) {
+                    featuredImageId = mediaData.id;
+                }
+            } catch (error: any) {
+                console.error('Image upload failed:', error);
+                return { success: false, message: `Image upload failed: ${error.message}` };
+            }
+        }
+
+        const postData: any = {
+            title: generatedContent.title,
+            content: contentWithWpImages + generateSchemaMarkup(generatedContent.jsonLdSchema),
+            status: status,
+            slug: generatedContent.slug,
+            meta: {
+                _yoast_wpseo_title: generatedContent.title,
+                _yoast_wpseo_metadesc: generatedContent.metaDescription,
+                rank_math_title: generatedContent.title,
+                rank_math_description: generatedContent.metaDescription,
+            }
+        };
+        if (featuredImageId) {
+            postData.featured_media = featuredImageId;
+        }
+
+        try {
+            let apiUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts`;
+            let method = 'POST';
+
+            if (itemToPublish.originalUrl) {
+                const slug = extractSlugFromUrl(itemToPublish.originalUrl);
+                const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id`;
+                const headers = new Headers({ 'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}` });
+                const lookupResponse = await fetchWordPressWithRetry(lookupUrl, { headers });
+                
+                if (!lookupResponse.ok) throw new Error('Failed to look up original post for update.');
+                
+                const posts = await lookupResponse.json();
+                if (posts.length > 0) {
+                    const postId = posts[0].id;
+                    apiUrl = `${apiUrl}/${postId}`;
+                } else {
+                     return { success: false, message: `Could not find original post with slug "${slug}" to update.` };
+                }
+            }
+
+            const postResponse = await fetchWordPressWithRetry(apiUrl, {
+                method: 'POST', // POST works for both create and update with ID
+                headers: {
+                    'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(postData)
+            });
+            
+            const responseData = await postResponse.json();
+            if (!postResponse.ok) {
+                throw new Error(responseData.message || `API returned status ${postResponse.status}`);
+            }
+            
+            const actionText = itemToPublish.originalUrl ? 'updated' : 'published';
+            return {
+                success: true,
+                message: (<span>Successfully {actionText}! <a href={responseData.link} target="_blank" rel="noopener noreferrer">View Post</a></span>),
+                link: responseData.link,
+            };
+        } catch (error: any) {
+            return { success: false, message: `Error: ${error.message}` };
+        }
+    };
 
     return (
         <div className="app-container">
@@ -4245,7 +4393,7 @@ const App = () => {
                     onPublishSuccess={(originalUrl) => {
                         setExistingPages(prev => prev.map(p => p.id === originalUrl ? {...p, publishedState: 'updated'} : p));
                     }}
-                    publishItem={async () => ({success: false, message: 'TODO'})}
+                    publishItem={publishItemToWordPress}
                     callAI={callAI}
                     geoTargeting={geoTargeting}
                 />
@@ -4255,7 +4403,7 @@ const App = () => {
                     items={items.filter(i => i.status === 'done' && selectedItems.has(i.id))}
                     onClose={() => setIsBulkPublishModalOpen(false)}
                     wpPassword={wpPassword}
-                    publishItem={async () => ({success: false, message: 'TODO'})}
+                    publishItem={publishItemToWordPress}
                     onPublishSuccess={(originalUrl) => {
                          setExistingPages(prev => prev.map(p => p.id === originalUrl ? {...p, publishedState: 'updated'} : p));
                     }}
