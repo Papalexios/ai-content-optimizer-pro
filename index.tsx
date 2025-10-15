@@ -11,8 +11,8 @@ const AI_MODELS = {
     GEMINI_IMAGEN: 'imagen-4.0-generate-001',
     OPENAI_GPT4_TURBO: 'gpt-4o',
     OPENAI_DALLE3: 'dall-e-3',
-    ANTHROPIC_OPUS: 'claude-3-7-sonnet-20250219',
-    ANTHROPIC_HAIKU: 'claude-3-5-haiku-20241022',
+    ANTHROPIC_OPUS: 'claude-3-opus-20240229',
+    ANTHROPIC_HAIKU: 'claude-3-haiku-20240307',
     OPENROUTER_DEFAULT: [
         'google/gemini-2.5-flash',
         'anthropic/claude-3-haiku',
@@ -20,14 +20,10 @@ const AI_MODELS = {
         'openrouter/auto'
     ],
     GROQ_MODELS: [
-        'llama-3.3-70b-versatile',
-        'llama-3.1-8b-instant',
-        'gemma2-9b-it',
         'llama3-70b-8192',
         'llama3-8b-8192',
         'mixtral-8x7b-32768',
         'gemma-7b-it',
-        'meta-llama/llama-4-scout-17b-16e-instruct',
     ]
 };
 
@@ -612,7 +608,7 @@ const fetchWithProxies = async (
  */
 const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit): Promise<Response> => {
     const REQUEST_TIMEOUT = 30000; // 30 seconds for potentially large uploads
-    const hasAuthHeader = options.headers && (options.headers as Headers).get('Authorization');
+    const hasAuthHeader = options.headers && (options.headers as Headers).has('Authorization');
 
     // If the request has an Authorization header, it MUST be a direct request.
     // Proxies will strip authentication headers and cause a guaranteed failure.
@@ -1161,7 +1157,7 @@ const enforceUniqueVideoEmbeds = (content: string, youtubeVideos: any[]): string
         if (secondVideo && secondVideo.videoId && secondVideo.videoId !== duplicateId) {
             const secondMatch = matches[1]; // The second iframe tag found
             // Find the start index of the second match to ensure we don't replace the first one
-            const secondMatchIndex = content.indexOf(secondMatch[0], secondMatch.index);
+            const secondMatchIndex = content.indexOf(secondMatch[0], secondMatch.index as number);
 
             if (secondMatchIndex !== -1) {
                 // Construct the replacement iframe tag by replacing just the ID
@@ -1801,7 +1797,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                     <circle className="gauge-bg" cx={size/2} cy={size/2} r={radius} />
                     <circle className="gauge-fg" cx={size/2} cy={size/2} r={radius} stroke={strokeColor} strokeDasharray={circumference} strokeDashoffset={offset} />
                 </svg>
-                <span className="score-gauge-text" style={{ color: strokeColor, fontSize: `${size / 40}rem` }}>{score}</span>
+                <span className="score-gauge-text" style={{ color: strokeColor }}>{score}</span>
             </div>
         );
     };
@@ -1845,7 +1841,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                      <div className="serp-preview-container">
                         <div className="serp-preview">
                             <div className="serp-url">{formatSerpUrl(slug)}</div>
-                            <a href="#" className="serp-title" onClick={(e) => e.preventDefault()} tabIndex={-1}>{title}</a>
+                            <h3 className="serp-title">{title}</h3>
                             <div className="serp-description">{metaDescription}</div>
                         </div>
                     </div>
@@ -1871,14 +1867,14 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                                 </button>
                                 <span className={`char-counter ${metaStatus}`}>{metaLength} / 155</span>
                             </div>
-                            <textarea id="metaDescription" name="metaDescription" className="meta-description-input" value={metaDescription} onChange={onSeoChange}></textarea>
+                            <textarea id="metaDescription" name="metaDescription" rows={3} value={metaDescription} onChange={onSeoChange}></textarea>
                             <div className="progress-bar-container">
                             <div className={`progress-bar-fill ${metaStatus}`} style={{ width: `${Math.min(100, (metaLength / 155) * 100)}%` }}></div>
                             </div>
                         </div>
                         <div className="form-group">
                             <label htmlFor="slug">Full URL</label>
-                            <input type="text" id="slug" name="slug" value={slug} onChange={onUrlChange} disabled={isUpdate} aria-describedby={isUpdate ? "slug-help" : "slug-help-new"} />
+                            <input type="text" id="slug" name="slug" value={slug} onChange={onUrlChange} disabled={isUpdate} />
                         </div>
                     </div>
                 </div>
@@ -2043,7 +2039,6 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
     useEffect(() => {
         if (item && item.generatedContent) {
             const isUpdate = !!item.originalUrl;
-            // When updating, the slug should be the original full URL. When creating, it's base URL + slug.
             const fullUrl = isUpdate 
                 ? item.originalUrl! 
                 : `${wpConfig.url.replace(/\/+$/, '')}/${item.generatedContent.slug}`;
@@ -2054,10 +2049,15 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                 slug: fullUrl,
             });
             setEditedContent(item.generatedContent.content);
-            setActiveTab('Live Preview'); // Reset tab on new item
-            setWpPublishStatus('idle'); // Reset publish status
+            setActiveTab('Live Preview');
+            setWpPublishStatus('idle');
             setWpPublishMessage('');
             setShowConfetti(false);
+            
+            // SOTA FIX: Reset editor scroll position
+            if (editorRef.current) {
+                editorRef.current.scrollTop = 0;
+            }
         }
     }, [item, wpConfig.url]);
 
@@ -2080,7 +2080,6 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
 
 
     const previewContent = useMemo(() => {
-        // The editedContent now contains the base64 images directly, so no replacement is needed for preview.
         return editedContent;
     }, [editedContent]);
 
@@ -2090,9 +2089,6 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
     };
 
     const handleUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        // FIX: The `name` variable was not defined in this function's scope, causing an error.
-        // Destructuring `name` from `e.target` and using it as a computed property resolves the issue,
-        // but since this handler is only for the slug, explicitly setting it is clearer.
         setEditedSeo(prev => ({ ...prev, slug: e.target.value }));
     };
 
@@ -2169,16 +2165,12 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
 
         setWpPublishStatus('publishing');
         
-        // Create a temporary item with the latest edits for the publish function
         const itemWithEdits: ContentItem = {
             ...item,
             generatedContent: {
                 ...item.generatedContent!,
-                 // Use the edited SEO fields
                 title: editedSeo.title,
                 metaDescription: editedSeo.metaDescription,
-                // The slug for a *new* post is derived from the full URL.
-                // The publish function will handle extracting it.
                 slug: extractSlugFromUrl(editedSeo.slug),
                 content: editedContent,
             }
@@ -2481,41 +2473,19 @@ const AnalysisModal = ({ page, onClose, onPlanRewrite }: AnalysisModalProps) => 
 const AppFooter = memo(() => (
     <footer className="app-footer">
         <div className="footer-grid">
-            <div className="footer-column footer-logo-column">
+            <div className="footer-logo-column">
                 <a href="https://affiliatemarketingforsuccess.com/" target="_blank" rel="noopener noreferrer">
-                    <img src="https://affiliatemarketingforsuccess.com/wp-content/uploads/2023/03/cropped-Affiliate-Marketing-for-Success-Logo-Edited.png?lm=6666FEE0" alt="AffiliateMarketingForSuccess.com Logo" className="footer-logo-img" width="266" height="45" loading="lazy" />
+                    <img src="https://affiliatemarketingforsuccess.com/wp-content/uploads/2023/03/cropped-Affiliate-Marketing-for-Success-Logo-Edited.png?lm=6666FEE0" alt="AffiliateMarketingForSuccess.com Logo" className="footer-logo-img" />
                 </a>
-                <p className="footer-tagline">
-                    Empowering creators with cutting-edge tools for digital success.
-                </p>
-            </div>
-            <div className="footer-column">
-                <h4 className="footer-heading">Resources</h4>
-                <ul className="footer-links-list">
-                    <li><a href="https://affiliatemarketingforsuccess.com/affiliate-marketing" target="_blank" rel="noopener noreferrer">Affiliate Marketing</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/ai" target="_blank" rel="noopener noreferrer">AI Automation</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/seo" target="_blank" rel="noopener noreferrer">SEO Strategy</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/blogging" target="_blank" rel="noopener noreferrer">Blogging Guides</a></li>
-                </ul>
-            </div>
-            <div className="footer-column">
-                <h4 className="footer-heading">Company</h4>
-                <ul className="footer-links-list">
-                    <li><a href="https://affiliatemarketingforsuccess.com/about/" target="_blank" rel="noopener noreferrer">About Us</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/review" target="_blank" rel="noopener noreferrer">Reviews</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/contact/" target="_blank" rel="noopener noreferrer">Contact</a></li>
-                </ul>
+                <p className="footer-tagline">Empowering creators with cutting-edge tools.</p>
             </div>
              <div className="footer-column">
-                <h4 className="footer-heading">Legal</h4>
                 <ul className="footer-links-list">
+                    <li><a href="https://affiliatemarketingforsuccess.com/about/" target="_blank" rel="noopener noreferrer">About</a></li>
+                    <li><a href="https://affiliatemarketingforsuccess.com/contact/" target="_blank" rel="noopener noreferrer">Contact</a></li>
                     <li><a href="https://affiliatemarketingforsuccess.com/privacy-policy/" target="_blank" rel="noopener noreferrer">Privacy Policy</a></li>
-                    <li><a href="https://affiliatemarketingforsuccess.com/terms-of-service/" target="_blank" rel="noopener noreferrer">Terms of Service</a></li>
                 </ul>
             </div>
-        </div>
-        <div className="footer-bottom-bar">
-             <p>This App is Created by <a href="https://affiliatemarketingforsuccess.com/about" target="_blank" rel="noopener noreferrer"><strong>Alexios Papaioannou</strong></a>, Owner of <a href="https://affiliatemarketingforsuccess.com/" target="_blank" rel="noopener noreferrer">affiliatemarketingforsuccess.com</a></p>
         </div>
     </footer>
 ));
@@ -2528,7 +2498,6 @@ const App = () => {
     // Step 1: API Keys & Config
     const [apiKeys, setApiKeys] = useState(() => {
         const saved = localStorage.getItem('apiKeys');
-        // FIX: Remove Gemini API key from state to enforce usage of environment variable, and handle migration from old localStorage values.
         const initialKeys = saved ? JSON.parse(saved) : { openaiApiKey: '', anthropicApiKey: '', openrouterApiKey: '', serperApiKey: '', groqApiKey: '' };
         if (initialKeys.geminiApiKey) {
             delete initialKeys.geminiApiKey;
@@ -2606,7 +2575,6 @@ const App = () => {
 
     // --- Effects ---
     
-    // Persist settings to localStorage
     useEffect(() => { localStorage.setItem('apiKeys', JSON.stringify(apiKeys)); }, [apiKeys]);
     useEffect(() => { localStorage.setItem('selectedModel', selectedModel); }, [selectedModel]);
     useEffect(() => { localStorage.setItem('selectedGroqModel', selectedGroqModel); }, [selectedGroqModel]);
@@ -2615,14 +2583,12 @@ const App = () => {
     useEffect(() => { localStorage.setItem('geoTargeting', JSON.stringify(geoTargeting)); }, [geoTargeting]);
     useEffect(() => { localStorage.setItem('siteInfo', JSON.stringify(siteInfo)); }, [siteInfo]);
 
-    // FIX: Initialize Gemini client from environment variable on component mount, per guidelines.
     useEffect(() => {
         (async () => {
             if (process.env.API_KEY) {
                 try {
                     setApiKeyStatus(prev => ({...prev, gemini: 'validating' }));
                     const geminiClient = new GoogleGenAI({ apiKey: process.env.API_KEY });
-                    // A quick test call to ensure the key is valid.
                     await callAiWithRetry(() => geminiClient.models.generateContent({ model: AI_MODELS.GEMINI_FLASH, contents: 'test' }));
                     setApiClients(prev => ({ ...prev, gemini: geminiClient }));
                     setApiKeyStatus(prev => ({...prev, gemini: 'valid' }));
@@ -2640,7 +2606,6 @@ const App = () => {
     }, []);
 
 
-    // Initialize Web Worker
     useEffect(() => {
         const workerCode = `
             self.addEventListener('message', async (e) => {
@@ -2717,7 +2682,7 @@ const App = () => {
                             }
                             return {
                                 id: url,
-                                title: url, // Use URL as initial title
+                                title: url,
                                 slug: extractSlugFromUrl(url),
                                 lastMod: data.lastmod,
                                 wordCount: null,
@@ -2726,7 +2691,7 @@ const App = () => {
                                 updatePriority: null,
                                 justification: null,
                                 daysOld: daysOld,
-                                isStale: false, // Will be calculated after content analysis
+                                isStale: false,
                                 publishedState: 'none',
                                 status: 'idle',
                                 analysis: null,
@@ -2772,7 +2737,6 @@ const App = () => {
         };
     }, []);
 
-    // Clear hub page selection when filters change to avoid confusion
     useEffect(() => {
         setSelectedHubPages(new Set());
     }, [hubSearchFilter, hubStatusFilter]);
@@ -2780,12 +2744,10 @@ const App = () => {
      const filteredAndSortedHubPages = useMemo(() => {
         let filtered = [...existingPages];
 
-        // Status filter
         if (hubStatusFilter !== 'All') {
             filtered = filtered.filter(page => page.updatePriority === hubStatusFilter);
         }
 
-        // Search filter
         if (hubSearchFilter) {
             filtered = filtered.filter(page =>
                 page.title.toLowerCase().includes(hubSearchFilter.toLowerCase()) ||
@@ -2793,35 +2755,29 @@ const App = () => {
             );
         }
 
-        // Sorting
         if (hubSortConfig.key) {
             filtered.sort((a, b) => {
                  if (hubSortConfig.key === 'default') {
-                    // 1. Stale content first (true is "smaller" so it comes first with asc)
                     if (a.isStale !== b.isStale) {
                         return a.isStale ? -1 : 1;
                     }
-                    // 2. Older content first
                     if (a.daysOld !== b.daysOld) {
                         return (b.daysOld ?? 0) - (a.daysOld ?? 0);
                     }
-                    // 3. Thinner content first
                     return (a.wordCount ?? 0) - (b.wordCount ?? 0);
                 }
 
                 let valA = a[hubSortConfig.key as keyof typeof a];
                 let valB = b[hubSortConfig.key as keyof typeof b];
 
-                // Handle boolean sorting for 'isStale'
                 if (typeof valA === 'boolean' && typeof valB === 'boolean') {
                     if (valA === valB) return 0;
                     if (hubSortConfig.direction === 'asc') {
-                        return valA ? -1 : 1; // true comes first
+                        return valA ? -1 : 1;
                     }
-                    return valA ? 1 : -1; // false comes first
+                    return valA ? 1 : -1;
                 }
 
-                // Handle null or undefined values for sorting
                 if (valA === null || valA === undefined) valA = hubSortConfig.direction === 'asc' ? Infinity : -Infinity;
                 if (valB === null || valB === undefined) valB = hubSortConfig.direction === 'asc' ? Infinity : -Infinity;
 
@@ -2890,7 +2846,7 @@ const App = () => {
                         dangerouslyAllowBrowser: true,
                     });
                     await callAiWithRetry(() => (client as OpenAI).chat.completions.create({
-                        model: AI_MODELS.GROQ_MODELS[1], // Use a small model for testing
+                        model: AI_MODELS.GROQ_MODELS[1],
                         messages: [{ role: "user", content: "test" }],
                         max_tokens: 1
                     }));
@@ -2936,7 +2892,7 @@ const App = () => {
                 validateApiKey(key.replace('ApiKey', ''), value as string);
             }
         });
-    }, []); // Run only on initial mount to validate saved keys
+    }, []);
 
     const handleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
         const { name, value } = e.target;
@@ -3046,20 +3002,17 @@ const App = () => {
 
     const sanitizeTitle = (title: string, slug: string): string => {
         try {
-            // A simple check if the title is a URL.
             new URL(title);
-            // If it is a URL, convert slug to a readable title.
             const decodedSlug = decodeURIComponent(slug);
             return decodedSlug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
         } catch (e) {
-            // It's not a URL, so it's a valid title. Return as is.
             return title;
         }
     };
 
     const handlePlanRewrite = (page: SitemapPage) => {
         const newItem: ContentItem = { 
-            id: page.id, // Use stable ID
+            id: page.id,
             title: sanitizeTitle(page.title, page.slug), 
             type: 'standard', 
             originalUrl: page.id, 
@@ -3116,7 +3069,7 @@ const App = () => {
             analysis: page.analysis,
         }));
         dispatch({ type: 'SET_ITEMS', payload: newItems });
-        setSelectedHubPages(new Set()); // Clear selection after adding
+        setSelectedHubPages(new Set());
         setActiveView('review');
     };
     
@@ -3188,7 +3141,6 @@ const App = () => {
                 'json'
             );
             
-            // The callAI function already ensures responseText is not null or empty.
             const parsedJson = JSON.parse(extractJson(responseText));
             
             const newItems: Partial<ContentItem>[] = [
@@ -3217,7 +3169,6 @@ const App = () => {
         setActiveView('review');
     };
 
-    // --- Image Generation Logic ---
     const handleGenerateImages = async () => {
         const geminiClient = apiClients.gemini;
         if (!geminiClient || apiKeyStatus.gemini !== 'valid') {
@@ -3274,7 +3225,6 @@ const App = () => {
         });
     };
 
-    // --- Step 3 Logic ---
     const handleToggleSelect = (itemId: string) => {
         setSelectedItems(prev => {
             const newSet = new Set(prev);
@@ -3365,7 +3315,6 @@ const App = () => {
     };
 
     const generateImageWithFallback = useCallback(async (prompt: string): Promise<string | null> => {
-        // Priority 1: OpenAI DALL-E 3
         if (apiClients.openai && apiKeyStatus.openai === 'valid') {
             try {
                 console.log("Attempting image generation with OpenAI DALL-E 3...");
@@ -3380,7 +3329,6 @@ const App = () => {
             }
         }
 
-        // Priority 2: Gemini Imagen
         if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
             try {
                  console.log("Attempting image generation with Google Gemini Imagen...");
@@ -3409,7 +3357,6 @@ const App = () => {
         if (!client) throw new Error(`API Client for '${selectedModel}' not initialized.`);
 
         const template = PROMPT_TEMPLATES[promptKey];
-        // Geo-targeting replacement is only relevant for the cluster planner
         const systemInstruction = (promptKey === 'cluster_planner') 
             ? template.systemInstruction.replace('{{GEO_TARGET_INSTRUCTIONS}}', (geoTargeting.enabled && geoTargeting.location) ? `All titles must be geo-targeted for "${geoTargeting.location}".` : '')
             : template.systemInstruction;
@@ -3459,8 +3406,8 @@ const App = () => {
                         const content = response.choices[0].message.content;
                         if (!content) throw new Error("Empty response from model.");
                         responseText = content;
-                        lastError = null; // Clear error on success
-                        break; // Success
+                        lastError = null;
+                        break;
                     } catch (error: any) {
                         console.error(`OpenRouter model '${modelName}' failed for '${promptKey}'. Trying next...`, error);
                         lastError = error;
@@ -3549,9 +3496,6 @@ const App = () => {
                     const finalOptimizedInnerContent = sanitizeHtmlResponse(optimizedContentHtml);
                     
                     let finalContentForPost: string;
-                    // CRITICAL FIX: Re-assemble the content. If we found a main container,
-                    // we replace its inner content and use the full outerHTML. Otherwise, we
-                    // have to use the returned content as-is (the fallback case).
                     if (mainContentElement && !isFallback) {
                         mainContentElement.innerHTML = finalOptimizedInnerContent;
                         finalContentForPost = mainContentElement.outerHTML;
@@ -3566,7 +3510,7 @@ const App = () => {
                         title: originalTitle,
                         slug: extractSlugFromUrl(item.originalUrl!),
                         metaDescription: originalMetaDesc,
-                        content: finalContentForPost, // Use the re-assembled content
+                        content: finalContentForPost,
                         primaryKeyword: originalTitle,
                         semanticKeywords: [],
                         imageDetails: [],
@@ -3598,7 +3542,6 @@ const App = () => {
                 
                 const isPillar = item.type === 'pillar';
 
-                // --- STAGE 1: SERP & Keyword Intelligence ---
                 if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
                     dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Fetching SERP Data...' } });
                     const cacheKey = `serp-${item.title}`;
@@ -3659,24 +3602,18 @@ const App = () => {
 
                 if (stopGenerationRef.current.has(item.id)) break;
 
-                // --- STAGE 2: Generate Metadata and Outline ---
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/5: Generating Article Outline...' } });
                 const outlineResponseText = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, peopleAlsoAsk, existingPages, item.crawledContent, item.analysis], 'json', useGoogleSearch);
-                rawResponseForDebugging = outlineResponseText; // Save for debugging if JSON parse fails
+                rawResponseForDebugging = outlineResponseText;
                 const metaAndOutline = JSON.parse(extractJson(outlineResponseText));
 
-                // SOTA FIX: Sanitize the introduction and conclusion HTML that comes from the JSON payload.
-                // This is the root cause of the layout distortion, as the AI was wrapping these
-                // specific fields in markdown fences, which were not being stripped.
                 metaAndOutline.introduction = sanitizeHtmlResponse(metaAndOutline.introduction);
                 metaAndOutline.conclusion = sanitizeHtmlResponse(metaAndOutline.conclusion);
 
-                // --- STAGE 3: Generate Content Section-by-Section ---
                 const fullFaqData: { question: string, answer: string }[] = [];
                 let contentParts: string[] = [];
                 contentParts.push(metaAndOutline.introduction);
                 
-                // Add E-E-A-T Box
                 contentParts.push(generateEeatBoxHtml(siteInfo, item.title));
                 
                 contentParts.push(`<h3>Key Takeaways</h3>\n<ul>\n${metaAndOutline.keyTakeaways.map((t: string) => `<li>${t}</li>`).join('\n')}\n</ul>`);
@@ -3691,12 +3628,11 @@ const App = () => {
                     sectionContent += sanitizeHtmlResponse(sectionHtml);
                     contentParts.push(sectionContent);
                     
-                    // Embed YouTube videos at strategic points
                     if (youtubeVideos && youtubeVideos.length > 0) {
-                        if (i === 1 && youtubeVideos[0]) { // After 2nd section
+                        if (i === 1 && youtubeVideos[0]) {
                             contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[0].embedUrl}" title="${youtubeVideos[0].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
                         }
-                        if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) { // In the middle
+                        if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) {
                             contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[1].embedUrl}" title="${youtubeVideos[1].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
                         }
                     }
@@ -3724,14 +3660,12 @@ const App = () => {
                     break;
                 }
 
-                // --- SOTA: Multi-layered Reference Generation ---
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Finding Real Sources...` } });
                 const contentSummaryForRefs = contentParts.join(' ').replace(/<[^>]+>/g, ' ').substring(0, 2000);
                 
                 let references: any[] | null = null;
                 let rawSearchResultsForFallback: any[] = [];
 
-                // STRATEGY 1: Iterative, targeted search with Serper API
                 if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
                     const searchQueries = [
                         `academic research and studies on "${metaAndOutline.title}" filetype:pdf`,
@@ -3769,7 +3703,6 @@ const App = () => {
                     }
                 }
 
-                // STRATEGY 2 (FALLBACK): Use Gemini's built-in Google Search Grounding
                 if (!references || references.length === 0) {
                     try {
                         console.log("Finding references using Gemini's Google Search grounding as a fallback...");
@@ -3780,7 +3713,6 @@ const App = () => {
                     }
                 }
                 
-                // --- FINAL DECISION & SOTA FALLBACK ---
                 if (references && Array.isArray(references) && references.length > 0) {
                     let referencesHtml = '<h2>References</h2>\n<ol>\n';
                     for (const ref of references) {
@@ -3822,7 +3754,6 @@ const App = () => {
 
                 let finalContent = contentParts.join('\n\n');
                 
-                // --- STAGE 4: Image Generation & Placement ---
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/5: Generating Images...' } });
                 const updatedImageDetails = [...metaAndOutline.imageDetails];
                 for (let i = 0; i < updatedImageDetails.length; i++) {
@@ -3835,26 +3766,23 @@ const App = () => {
                             const imageHtml = `<figure class="wp-block-image size-large"><img src="${generatedImageSrc}" alt="${imageDetail.altText}" title="${imageDetail.title}"/><figcaption>${imageDetail.altText}</figcaption></figure>`;
                             finalContent = finalContent.replace(imageDetail.placeholder, imageHtml);
                         } else {
-                             finalContent = finalContent.replace(imageDetail.placeholder, ''); // Remove placeholder if generation fails
+                             finalContent = finalContent.replace(imageDetail.placeholder, '');
                         }
                     } catch (imgError) {
                         console.error(`Failed to generate image for prompt: "${imageDetail.prompt}"`, imgError);
                         finalContent = finalContent.replace(imageDetail.placeholder, '');
                     }
                 }
-                finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, ''); // Clean up any remaining placeholders
+                finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, '');
 
-                 // --- STAGE 5: Final Assembly & Quality Checks ---
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 5/5: Finalizing...' } });
                 
-                // Link validation and quota enforcement
                 finalContent = sanitizeBrokenPlaceholders(finalContent);
                 finalContent = validateAndRepairInternalLinks(finalContent, existingPages);
                 finalContent = enforceInternalLinkQuota(finalContent, existingPages, metaAndOutline.primaryKeyword, MIN_INTERNAL_LINKS);
                 finalContent = processInternalLinks(finalContent, existingPages);
                 finalContent = enforceUniqueVideoEmbeds(finalContent, youtubeVideos || []);
 
-                // Word count enforcement
                 const minWords = isPillar ? TARGET_MIN_WORDS_PILLAR : TARGET_MIN_WORDS;
                 const maxWords = isPillar ? TARGET_MAX_WORDS_PILLAR : TARGET_MAX_WORDS;
                 enforceWordCount(finalContent, minWords, maxWords);
@@ -3874,9 +3802,7 @@ const App = () => {
             } catch (error: any) {
                 console.error(`Error generating content for "${item.title}":`, error);
                 
-                // If it's a content quality error, save the partial content for review.
                 if (error instanceof ContentTooShortError) {
-                    // Try to salvage what was generated
                     const salvagedContent = normalizeGeneratedContent({
                         title: item.title,
                         content: error.content,
@@ -3884,7 +3810,6 @@ const App = () => {
 
                     dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: salvagedContent } });
                     
-                    // Update status to error but with a special message
                     dispatch({
                         type: 'UPDATE_STATUS',
                         payload: {
@@ -3900,7 +3825,7 @@ const App = () => {
                 generatedCount++;
                 setGenerationProgress({ current: generatedCount, total: itemsToGenerate.length });
             }
-        } // End of for...of loop for itemsToGenerate
+        }
 
         setIsGenerating(false);
 
@@ -3932,6 +3857,7 @@ const App = () => {
                 const res = await fetch(`data:${mimeType};base64,${base64Data}`);
                 const blob = await res.blob();
                 const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
+                
                 const headers = new Headers({
                     'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
                     'Content-Disposition': `attachment; filename="${imgTitle}-${index}.${imageMatch[1]}"`,
@@ -3981,7 +3907,9 @@ const App = () => {
 
             if (itemToPublish.originalUrl) {
                 const slug = extractSlugFromUrl(itemToPublish.originalUrl);
-                const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id`;
+                // SOTA FIX: Search for posts in ANY status (publish, draft, pending, etc.) to ensure updates always work.
+                const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id&status=publish,future,draft,pending,private`;
+                
                 const headers = new Headers({ 'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}` });
                 const lookupResponse = await fetchWordPressWithRetry(lookupUrl, { headers });
                 
@@ -3997,11 +3925,11 @@ const App = () => {
             }
 
             const postResponse = await fetchWordPressWithRetry(apiUrl, {
-                method: 'POST', // POST works for both create and update with ID
-                headers: {
+                method: 'POST',
+                headers: new Headers({
                     'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
                     'Content-Type': 'application/json'
-                },
+                }),
                 body: JSON.stringify(postData)
             });
             
@@ -4241,7 +4169,7 @@ const App = () => {
                                                         <th onClick={() => handleHubSort('title')}>Title & Slug</th>
                                                         <th onClick={() => handleHubSort('daysOld')}>Age</th>
                                                         <th onClick={() => handleHubSort('updatePriority')}>Status</th>
-                                                        <th>Analysis & Actions</th>
+                                                         <th>Analysis & Actions</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
