@@ -2520,7 +2520,7 @@ const App = () => {
     // Step 2: Content Strategy
     const [contentMode, setContentMode] = useState('bulk'); // 'bulk', 'single', or 'imageGenerator'
     const [topic, setTopic] = useState('');
-    const [primaryKeyword, setPrimaryKeyword] = useState('');
+    const [primaryKeywords, setPrimaryKeywords] = useState('');
     const [sitemapUrl, setSitemapUrl] = useState('');
     const [isCrawling, setIsCrawling] = useState(false);
     const [crawlMessage, setCrawlMessage] = useState('');
@@ -2845,8 +2845,8 @@ const App = () => {
                         apiKey: key,
                         dangerouslyAllowBrowser: true,
                     });
-                    await callAiWithRetry(() => (client as OpenAI).chat.completions.create({
-                        model: AI_MODELS.GROQ_MODELS[1],
+                    await callAiWithRetry(() => client.chat.completions.create({
+                        model: selectedGroqModel,
                         messages: [{ role: "user", content: "test" }],
                         max_tokens: 1
                     }));
@@ -2884,7 +2884,7 @@ const App = () => {
             setApiKeyStatus(prev => ({ ...prev, [provider]: 'invalid' }));
             setApiClients(prev => ({ ...prev, [provider]: null }));
         }
-    }, 500), []);
+    }, 500), [selectedGroqModel]);
     
      useEffect(() => {
         Object.entries(apiKeys).forEach(([key, value]) => {
@@ -2893,6 +2893,13 @@ const App = () => {
             }
         });
     }, []);
+
+    // Re-validate Groq key when the model changes to give user feedback
+    useEffect(() => {
+        if (selectedModel === 'groq' && apiKeys.groqApiKey) {
+            validateApiKey('groq', apiKeys.groqApiKey);
+        }
+    }, [selectedModel, selectedGroqModel, apiKeys.groqApiKey, validateApiKey]);
 
     const handleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
         const { name, value } = e.target;
@@ -3162,10 +3169,17 @@ const App = () => {
         }
     };
     
-    const handleGenerateSingleFromKeyword = () => {
-        if (!primaryKeyword) return;
-        const newItem: Partial<ContentItem> = { id: primaryKeyword, title: primaryKeyword, type: 'standard' };
-        dispatch({ type: 'SET_ITEMS', payload: [newItem] });
+    const handleGenerateMultipleFromKeywords = () => {
+        const keywords = primaryKeywords.split('\n').map(k => k.trim()).filter(Boolean);
+        if (keywords.length === 0) return;
+
+        const newItems: Partial<ContentItem>[] = keywords.map(keyword => ({
+            id: keyword,
+            title: keyword,
+            type: 'standard'
+        }));
+        
+        dispatch({ type: 'SET_ITEMS', payload: newItems });
         setActiveView('review');
     };
 
@@ -4029,9 +4043,8 @@ const App = () => {
                                      {selectedModel === 'groq' && (
                                         <div className="form-group">
                                             <label htmlFor="groq-model-select">Groq Model</label>
-                                            <select id="groq-model-select" value={selectedGroqModel} onChange={e => setSelectedGroqModel(e.target.value)}>
-                                                {AI_MODELS.GROQ_MODELS.map(m => <option key={m} value={m}>{m}</option>)}
-                                            </select>
+                                            <input type="text" id="groq-model-select" value={selectedGroqModel} onChange={e => setSelectedGroqModel(e.target.value)} placeholder="e.g., llama3-70b-8192" />
+                                            <p className="help-text">Enter any model name compatible with the Groq API.</p>
                                         </div>
                                     )}
                                      <div className="form-group checkbox-group">
@@ -4122,12 +4135,13 @@ const App = () => {
                              {contentMode === 'single' && (
                                 <div className="tab-panel">
                                     <h3>Single Article from Keyword</h3>
-                                    <p className="help-text">Enter a specific primary keyword to generate one, highly-optimized article.</p>
+                                    <p className="help-text">Enter one or more specific primary keywords, each on a new line, to generate multiple articles at once.</p>
                                      <div className="form-group">
-                                        <label htmlFor="primaryKeyword">Primary Keyword</label>
-                                        <input type="text" id="primaryKeyword" value={primaryKeyword} onChange={e => setPrimaryKeyword(e.target.value)} placeholder="e.g., best camera for landscape photography" />
+                                        <label htmlFor="primaryKeywords">Primary Keywords (one per line)</label>
+                                        <textarea id="primaryKeywords" value={primaryKeywords} onChange={e => setPrimaryKeywords(e.target.value)} placeholder="e.g., best camera for landscape photography
+how to edit photos in lightroom" rows={5}></textarea>
                                     </div>
-                                    <button className="btn" onClick={handleGenerateSingleFromKeyword} disabled={!primaryKeyword}>Go to Review &rarr;</button>
+                                    <button className="btn" onClick={handleGenerateMultipleFromKeywords} disabled={!primaryKeywords.trim()}>Go to Review &rarr;</button>
                                 </div>
                             )}
                             {contentMode === 'hub' && (
@@ -4183,7 +4197,7 @@ const App = () => {
                                                             <td>{page.daysOld !== null ? `${page.daysOld} days` : 'N/A'}</td>
                                                             <td><div className="status-cell">{page.updatePriority ? <span className={`priority-${page.updatePriority}`}>{page.updatePriority}</span> : 'Not Analyzed'}</div></td>
                                                             <td>
-                                                                {page.status === 'analyzing' && <div className="status-cell"><div className="status-indicator analyzing"></div>Analyzing...</div>}
+                                                               {page.status === 'analyzing' && <div className="status-cell"><div className="status-indicator analyzing"></div>Analyzing...</div>}
                                                                 {page.status === 'error' && <div className="status-cell"><div className="status-indicator error"></div>Error</div>}
                                                                 {page.status === 'analyzed' && page.analysis && (
                                                                     <button className="btn btn-small" onClick={() => setViewingAnalysis(page)}>View Rewrite Plan</button>
