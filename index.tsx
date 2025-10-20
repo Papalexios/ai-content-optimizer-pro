@@ -8,6 +8,7 @@ import { generateFullSchema, generateSchemaMarkup, WpConfig } from './schema-gen
 import { SupabaseCache, saveGeneratedArticle, saveCompetitorAnalysis, saveInternalLink, initSupabase } from './supabase-cache';
 import { analyzeContentQuality, calculateEEATScore, synthesizeBestOutput, type ModelOutput, type ContentQualityMetrics } from './content-quality';
 import { analyzeCompetitors, formatCompetitorReport, type CompetitorInsights } from './competitor-analysis';
+import { initApiKeyManager, getApiKeyManager } from './api-key-manager';
 
 const AI_MODELS = {
     GEMINI_FLASH: 'gemini-2.5-flash',
@@ -199,8 +200,9 @@ class ContentCache {
 const apiCache = new ContentCache();
 const supabaseCache = new SupabaseCache();
 
-// Initialize Supabase on load
+// Initialize Supabase and API Key Manager on load
 initSupabase();
+const apiKeyManager = initApiKeyManager();
 
 // --- END: Performance & Caching Enhancements ---
 
@@ -3336,34 +3338,64 @@ const App = () => {
     };
 
     const generateImageWithFallback = useCallback(async (prompt: string): Promise<string | null> => {
+        // 🚀 Try OpenAI with intelligent rate limiting
         if (apiClients.openai && apiKeyStatus.openai === 'valid') {
             try {
-                console.log("Attempting image generation with OpenAI DALL-E 3...");
-                const openaiImgResponse = await callAiWithRetry(() => apiClients.openai!.images.generate({ model: AI_MODELS.OPENAI_DALLE3, prompt, n: 1, size: '1792x1024', response_format: 'b64_json' }));
-                const base64Image = openaiImgResponse.data[0].b64_json;
-                if (base64Image) {
-                    console.log("OpenAI image generation successful.");
-                    return `data:image/png;base64,${base64Image}`;
-                }
+                return await apiKeyManager.executeRequest(
+                    'openai',
+                    async () => {
+                        console.log("Attempting image generation with OpenAI DALL-E 3...");
+                        const openaiImgResponse = await callAiWithRetry(() =>
+                            apiClients.openai!.images.generate({
+                                model: AI_MODELS.OPENAI_DALLE3,
+                                prompt,
+                                n: 1,
+                                size: '1792x1024',
+                                response_format: 'b64_json'
+                            })
+                        );
+                        const base64Image = openaiImgResponse.data[0].b64_json;
+                        if (base64Image) {
+                            console.log("OpenAI image generation successful.");
+                            return `data:image/png;base64,${base64Image}`;
+                        }
+                        return null;
+                    },
+                    { estimatedTokens: 1000, model: AI_MODELS.OPENAI_DALLE3 }
+                );
             } catch (error: any) {
                 console.warn("OpenAI image generation failed, falling back to Gemini.", error);
             }
         }
 
+        // 🚀 Fallback to Gemini with intelligent rate limiting
         if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
             try {
-                 console.log("Attempting image generation with Google Gemini Imagen...");
-                 const geminiImgResponse = await callAiWithRetry(() => apiClients.gemini!.models.generateImages({ model: AI_MODELS.GEMINI_IMAGEN, prompt: prompt, config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' } }));
-                 const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
-                 if (base64Image) {
-                    console.log("Gemini image generation successful.");
-                    return `data:image/jpeg;base64,${base64Image}`;
-                 }
+                return await apiKeyManager.executeRequest(
+                    'gemini',
+                    async () => {
+                        console.log("Attempting image generation with Google Gemini Imagen...");
+                        const geminiImgResponse = await callAiWithRetry(() =>
+                            apiClients.gemini!.models.generateImages({
+                                model: AI_MODELS.GEMINI_IMAGEN,
+                                prompt: prompt,
+                                config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' }
+                            })
+                        );
+                        const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
+                        if (base64Image) {
+                            console.log("Gemini image generation successful.");
+                            return `data:image/jpeg;base64,${base64Image}`;
+                        }
+                        return null;
+                    },
+                    { estimatedTokens: 500, model: AI_MODELS.GEMINI_IMAGEN }
+                );
             } catch (error: any) {
-                 console.error("Gemini image generation also failed.", error);
+                console.error("Gemini image generation also failed.", error);
             }
         }
-        
+
         console.error("All image generation services failed or are unavailable.");
         return null;
     }, [apiClients, apiKeyStatus]);
@@ -3378,16 +3410,23 @@ const App = () => {
         if (!client) throw new Error(`API Client for '${selectedModel}' not initialized.`);
 
         const template = PROMPT_TEMPLATES[promptKey];
-        const systemInstruction = (promptKey === 'cluster_planner') 
+        const systemInstruction = (promptKey === 'cluster_planner')
             ? template.systemInstruction.replace('{{GEO_TARGET_INSTRUCTIONS}}', (geoTargeting.enabled && geoTargeting.location) ? `All titles must be geo-targeted for "${geoTargeting.location}".` : '')
             : template.systemInstruction;
-            
+
         // @ts-ignore
         const userPrompt = template.userPrompt(...promptArgs);
-        
-        let responseText: string | null = '';
 
-        switch (selectedModel) {
+        // 🚀 INTELLIGENT TOKEN ESTIMATION for rate limiting
+        const estimatedTokens = Math.ceil((systemInstruction.length + userPrompt.length) / 3);
+
+        // 🎯 WRAP API CALL WITH INTELLIGENT RATE LIMITING
+        return await apiKeyManager.executeRequest(
+            selectedModel,
+            async () => {
+                let responseText: string | null = '';
+
+                switch (selectedModel) {
             case 'gemini':
                  const geminiConfig: { systemInstruction: string; responseMimeType?: string; tools?: any[] } = { systemInstruction };
                 if (responseFormat === 'json') {
@@ -3455,11 +3494,21 @@ const App = () => {
                 break;
         }
 
-        if (!responseText) {
-            throw new Error(`AI returned an empty response for the '${promptKey}' stage.`);
-        }
+                if (!responseText) {
+                    throw new Error(`AI returned an empty response for the '${promptKey}' stage.`);
+                }
 
-        return responseText;
+                return responseText;
+            },
+            {
+                estimatedTokens,
+                model: selectedModel === 'gemini' ? AI_MODELS.GEMINI_FLASH :
+                       selectedModel === 'openai' ? AI_MODELS.OPENAI_GPT4_TURBO :
+                       selectedModel === 'anthropic' ? AI_MODELS.ANTHROPIC_HAIKU :
+                       selectedModel,
+                maxRetries: 3
+            }
+        );
     }, [apiClients, selectedModel, geoTargeting, openrouterModels, selectedGroqModel, useGoogleSearch]);
 
 
