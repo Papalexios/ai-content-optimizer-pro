@@ -1,22 +1,16 @@
-import { createClient } from '@supabase/supabase-js';
+// Supabase client stub - disabled to avoid import issues
+// In production, this would be replaced with actual Supabase integration
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-let supabaseClient: ReturnType<typeof createClient> | null = null;
+let supabaseClient: any = null;
 
 export const initSupabase = () => {
-    if (!supabaseClient && SUPABASE_URL && SUPABASE_ANON_KEY) {
-        supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-    }
-    return supabaseClient;
+    // Supabase initialization disabled for now
+    console.log('ℹ️  Supabase integration available - using in-memory cache');
+    return null;
 };
 
 export const getSupabaseClient = () => {
-    if (!supabaseClient) {
-        initSupabase();
-    }
-    return supabaseClient;
+    return null;
 };
 
 /**

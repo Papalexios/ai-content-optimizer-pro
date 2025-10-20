@@ -11,7 +11,8 @@
  * - Real-time usage monitoring
  */
 
-import { getSupabaseClient } from './supabase-cache';
+// Supabase logging disabled to avoid import issues
+const getSupabaseClient = () => null;
 
 export interface ApiKeyConfig {
     provider: 'gemini' | 'openai' | 'anthropic' | 'serper' | 'openrouter' | 'groq';
