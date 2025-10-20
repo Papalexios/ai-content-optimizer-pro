@@ -194,6 +194,13 @@ class ContentCache {
 }
 const apiCache = new ContentCache();
 
+// Stub for apiKeyManager
+const apiKeyManager = {
+    executeRequest: async (provider: string, fn: () => Promise<any>, options?: any) => {
+        return await fn();
+    }
+};
+
 // --- END: Performance & Caching Enhancements ---
 
 
