@@ -2498,10 +2498,7 @@ const App = () => {
     // Step 1: API Keys & Config
     const [apiKeys, setApiKeys] = useState(() => {
         const saved = localStorage.getItem('apiKeys');
-        const initialKeys = saved ? JSON.parse(saved) : { openaiApiKey: '', anthropicApiKey: '', openrouterApiKey: '', serperApiKey: '', groqApiKey: '' };
-        if (initialKeys.geminiApiKey) {
-            delete initialKeys.geminiApiKey;
-        }
+        const initialKeys = saved ? JSON.parse(saved) : { geminiApiKey: '', openaiApiKey: '', anthropicApiKey: '', openrouterApiKey: '', serperApiKey: '', groqApiKey: '' };
         return initialKeys;
     });
     const [apiKeyStatus, setApiKeyStatus] = useState({ gemini: 'idle', openai: 'idle', anthropic: 'idle', openrouter: 'idle', serper: 'idle', groq: 'idle' } as Record<string, 'idle' | 'validating' | 'valid' | 'invalid'>);
@@ -2583,27 +2580,6 @@ const App = () => {
     useEffect(() => { localStorage.setItem('geoTargeting', JSON.stringify(geoTargeting)); }, [geoTargeting]);
     useEffect(() => { localStorage.setItem('siteInfo', JSON.stringify(siteInfo)); }, [siteInfo]);
 
-    useEffect(() => {
-        (async () => {
-            if (process.env.API_KEY) {
-                try {
-                    setApiKeyStatus(prev => ({...prev, gemini: 'validating' }));
-                    const geminiClient = new GoogleGenAI({ apiKey: process.env.API_KEY });
-                    await callAiWithRetry(() => geminiClient.models.generateContent({ model: AI_MODELS.GEMINI_FLASH, contents: 'test' }));
-                    setApiClients(prev => ({ ...prev, gemini: geminiClient }));
-                    setApiKeyStatus(prev => ({...prev, gemini: 'valid' }));
-                } catch (e) {
-                    console.error("Gemini client initialization/validation failed:", e);
-                    setApiClients(prev => ({ ...prev, gemini: null }));
-                    setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
-                }
-            } else {
-                console.error("Gemini API key (API_KEY environment variable) is not set.");
-                setApiClients(prev => ({ ...prev, gemini: null }));
-                setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
-            }
-        })();
-    }, []);
 
 
     useEffect(() => {
@@ -2808,6 +2784,11 @@ const App = () => {
             let client;
             let isValid = false;
             switch (provider) {
+                case 'gemini':
+                    client = new GoogleGenAI({ apiKey: key });
+                    await callAiWithRetry(() => client.models.generateContent({ model: AI_MODELS.GEMINI_FLASH, contents: 'test' }));
+                    isValid = true;
+                    break;
                 case 'openai':
                     client = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
                     await callAiWithRetry(() => client.models.list());
@@ -3992,14 +3973,7 @@ const App = () => {
                                     <h3>API Keys</h3>
                                     <div className="form-group">
                                         <label>Google Gemini API Key</label>
-                                        <div className="api-key-group">
-                                            <input type="text" readOnly value="Loaded from Environment" disabled />
-                                             <div className="key-status-icon">
-                                                {apiKeyStatus.gemini === 'validating' && <div className="key-status-spinner"></div>}
-                                                {apiKeyStatus.gemini === 'valid' && <span className="success"><CheckIcon /></span>}
-                                                {apiKeyStatus.gemini === 'invalid' && <span className="error"><XIcon /></span>}
-                                            </div>
-                                        </div>
+                                        <ApiKeyInput provider="gemini" value={apiKeys.geminiApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.gemini} isEditing={editingApiKey === 'gemini'} onEdit={() => setEditingApiKey('gemini')} />
                                     </div>
                                     <div className="form-group">
                                         <label>OpenAI API Key</label>
