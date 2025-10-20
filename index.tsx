@@ -4,11 +4,11 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import React, { useState, useMemo, useEffect, useCallback, useReducer, useRef, memo } from 'react';
 import ReactDOM from 'react-dom/client';
-import { generateFullSchema, generateSchemaMarkup, WpConfig } from './schema-generator';
-import { SupabaseCache, saveGeneratedArticle, saveCompetitorAnalysis, saveInternalLink, initSupabase } from './supabase-cache';
-import { analyzeContentQuality, calculateEEATScore, synthesizeBestOutput, type ModelOutput, type ContentQualityMetrics } from './content-quality';
-import { analyzeCompetitors, formatCompetitorReport, type CompetitorInsights } from './competitor-analysis';
-import { initApiKeyManager, getApiKeyManager } from './api-key-manager';
+import { generateFullSchema, generateSchemaMarkup, WpConfig } from './src/schema-generator';
+import { SupabaseCache, saveGeneratedArticle, saveCompetitorAnalysis, saveInternalLink, initSupabase } from './src/supabase-cache';
+import { analyzeContentQuality, calculateEEATScore, synthesizeBestOutput, type ModelOutput, type ContentQualityMetrics } from './src/content-quality';
+import { analyzeCompetitors, formatCompetitorReport, type CompetitorInsights } from './src/competitor-analysis';
+import { initApiKeyManager, getApiKeyManager } from './src/api-key-manager';
 
 const AI_MODELS = {
     GEMINI_FLASH: 'gemini-2.5-flash',
