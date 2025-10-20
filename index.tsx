@@ -3663,10 +3663,10 @@ const App = () => {
                 const skCacheKey = `sk-${item.title}`;
                 semanticKeywords = apiCache.get(skCacheKey);
 
-                if (!semanticKeywords) {
-                    // Check Supabase persistent cache
-                    semanticKeywords = await supabaseCache.get('semantic_keywords', { title: item.title });
-                }
+                // if (!semanticKeywords) {
+                //     // Check Supabase persistent cache
+                //     semanticKeywords = await supabaseCache.get('semantic_keywords', { title: item.title });
+                // }
 
                 if (!semanticKeywords) {
                     console.log('[CACHE] Generating new semantic keywords...');
@@ -3676,7 +3676,7 @@ const App = () => {
 
                     // Store in both caches
                     apiCache.set(skCacheKey, semanticKeywords);
-                    await supabaseCache.set('semantic_keywords', { title: item.title }, semanticKeywords, item.title);
+                    // await supabaseCache.set('semantic_keywords', { title: item.title }, semanticKeywords, item.title);
                 } else {
                     console.log('[CACHE] Using cached semantic keywords');
                 }
