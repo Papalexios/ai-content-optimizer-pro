@@ -1191,8 +1191,9 @@ const normalizeGeneratedContent = (parsedJson: any, itemTitle: string): Generate
     const normalized = { ...parsedJson };
 
     // --- Critical Fields ---
-    if (!normalized.title) normalized.title = itemTitle;
-    if (!normalized.slug) normalized.slug = itemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
+    const safeItemTitle = itemTitle || 'untitled';
+    if (!normalized.title) normalized.title = safeItemTitle;
+    if (!normalized.slug) normalized.slug = safeItemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
     if (!normalized.content) {
         console.warn(`[Normalization] 'content' field was missing for "${itemTitle}". Defaulting to empty string.`);
         normalized.content = '';
@@ -1200,8 +1201,8 @@ const normalizeGeneratedContent = (parsedJson: any, itemTitle: string): Generate
 
     // --- Image Details: The main source of errors ---
     if (!normalized.imageDetails || !Array.isArray(normalized.imageDetails) || normalized.imageDetails.length === 0) {
-        console.warn(`[Normalization] 'imageDetails' was missing or invalid for "${itemTitle}". Generating default image prompts.`);
-        const slugBase = normalized.slug || itemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
+        console.warn(`[Normalization] 'imageDetails' was missing or invalid for "${safeItemTitle}". Generating default image prompts.`);
+        const slugBase = normalized.slug || safeItemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
         normalized.imageDetails = [
             {
                 prompt: `A high-quality, photorealistic image representing the concept of: "${normalized.title}". Cinematic, professional blog post header image, 16:9 aspect ratio.`,
