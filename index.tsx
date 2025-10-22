@@ -3845,123 +3845,191 @@ const App = () => {
 
     }, [apiClients, apiKeys, apiKeyStatus, callAI, existingPages, generateImageWithFallback, geoTargeting, openrouterModels, selectedGroqModel, selectedModel, siteInfo, useGoogleSearch, wpConfig]);
     
-    const publishItemToWordPress = async (
-        itemToPublish: ContentItem,
-        currentWpPassword: string,
-        status: 'publish' | 'draft'
-    ): Promise<{ success: boolean; message: React.ReactNode; link?: string }> => {
-        const { generatedContent } = itemToPublish;
-        if (!generatedContent) {
-            return { success: false, message: 'No content to publish.' };
-        }
+const publishItemToWordPress = async (
+    itemToPublish: ContentItem,
+    currentWpPassword: string,
+    status: 'publish' | 'draft'
+): Promise<{ success: boolean; message: React.ReactNode; link?: string }> => {
+    const { generatedContent } = itemToPublish;
+    if (!generatedContent) {
+        return { success: false, message: 'No content to publish.' };
+    }
 
-        let contentWithWpImages = generatedContent.content;
-        let featuredImageId: number | null = null;
-        const base64ImageRegex = /<img[^>]+src="data:image\/(jpeg|png|webp);base64,([^"]+)"[^>]*>/g;
-        const imagesToUpload = [...contentWithWpImages.matchAll(base64ImageRegex)];
+    let contentWithWpImages = generatedContent.content;
+    let featuredImageId: number | null = null;
+    const base64ImageRegex = /<img[^>]+src="data:image\/(jpeg|png|webp);base64,([^"]+)"[^>]*>/g;
 
-        for (const [index, imageMatch] of imagesToUpload.entries()) {
-            const fullImgTag = imageMatch[0];
-            const mimeType = `image/${imageMatch[1]}`;
-            const base64Data = imageMatch[2];
-            const altText = fullImgTag.match(/alt="([^"]*)"/)?.[1] || generatedContent.title;
-            const imgTitle = fullImgTag.match(/title="([^"]*)"/)?.[1] || generatedContent.slug;
+    const imagesToUpload = [...contentWithWpImages.matchAll(base64ImageRegex)].map((match, index) => {
+        const fullImgTag = match[0];
+        const base64Data = `data:image/${match[1]};base64,${match[2]}`;
+        const altText = fullImgTag.match(/alt="([^"]*)"/)?.[1] || generatedContent.title;
+        const imgTitle = fullImgTag.match(/title="([^"]*)"/)?.[1] || generatedContent.slug;
+        return { fullImgTag, base64Data, altText, imgTitle, index };
+    });
 
-            try {
-                const res = await fetch(`data:${mimeType};base64,${base64Data}`);
-                const blob = await res.blob();
-                const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
-                
-                const headers = new Headers({
-                    'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
-                    'Content-Disposition': `attachment; filename="${imgTitle}-${index}.${imageMatch[1]}"`,
-                    'Content-Type': mimeType,
-                });
-
-                const uploadResponse = await fetchWordPressWithRetry(uploadUrl, { method: 'POST', headers, body: blob });
-                
-                if (!uploadResponse.ok) {
-                    const errorData = await uploadResponse.json().catch(() => ({ message: 'Unknown upload error' }));
-                    throw new Error(`Media upload failed: ${errorData.message}`);
-                }
-                
-                const mediaData = await uploadResponse.json();
-                const newImageUrl = mediaData.source_url;
-                const newImgTag = fullImgTag.replace(/src="[^"]+"/, `src="${newImageUrl}" class="wp-image-${mediaData.id}"`);
-                contentWithWpImages = contentWithWpImages.replace(fullImgTag, newImgTag);
-
-                if (index === 0) {
-                    featuredImageId = mediaData.id;
-                }
-            } catch (error: any) {
-                console.error('Image upload failed:', error);
-                return { success: false, message: `Image upload failed: ${error.message}` };
-            }
-        }
-
-        const postData: any = {
-            title: generatedContent.title,
-            content: contentWithWpImages + generateSchemaMarkup(generatedContent.jsonLdSchema),
-            status: status,
-            slug: generatedContent.slug,
-            meta: {
-                _yoast_wpseo_title: generatedContent.title,
-                _yoast_wpseo_metadesc: generatedContent.metaDescription,
-                rank_math_title: generatedContent.title,
-                rank_math_description: generatedContent.metaDescription,
-            }
-        };
-        if (featuredImageId) {
-            postData.featured_media = featuredImageId;
-        }
-
+    for (const image of imagesToUpload) {
         try {
-            let apiUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts`;
-            let method = 'POST';
-
-            if (itemToPublish.originalUrl) {
-                const slug = extractSlugFromUrl(itemToPublish.originalUrl);
-                // SOTA FIX: Search for posts in ANY status (publish, draft, pending, etc.) to ensure updates always work.
-                const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id&status=publish,future,draft,pending,private`;
-                
-                const headers = new Headers({ 'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}` });
-                const lookupResponse = await fetchWordPressWithRetry(lookupUrl, { headers });
-                
-                if (!lookupResponse.ok) throw new Error('Failed to look up original post for update.');
-                
-                const posts = await lookupResponse.json();
-                if (posts.length > 0) {
-                    const postId = posts[0].id;
-                    apiUrl = `${apiUrl}/${postId}`;
-                } else {
-                     return { success: false, message: `Could not find original post with slug "${slug}" to update.` };
-                }
-            }
-
-            const postResponse = await fetchWordPressWithRetry(apiUrl, {
-                method: 'POST',
-                headers: new Headers({
-                    'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
-                    'Content-Type': 'application/json'
-                }),
-                body: JSON.stringify(postData)
+            const { blob: webpBlob, mimeType: webpMimeType } = await convertToWebP(image.base64Data);
+            const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
+            
+            const headers = new Headers({
+                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
+                'Content-Disposition': `attachment; filename="${image.imgTitle}-${image.index}.webp"`,
+                'Content-Type': webpMimeType,
             });
+
+            const uploadResponse = await fetchWordPressWithRetry(uploadUrl, { method: 'POST', headers, body: webpBlob });
             
-            const responseData = await postResponse.json();
-            if (!postResponse.ok) {
-                throw new Error(responseData.message || `API returned status ${postResponse.status}`);
+            if (!uploadResponse.ok) {
+                const errorData = await uploadResponse.json().catch(() => ({ message: 'Unknown upload error' }));
+                throw new Error(`Media upload failed: ${errorData.message}`);
             }
             
-            const actionText = itemToPublish.originalUrl ? 'updated' : 'published';
-            return {
-                success: true,
-                message: (<span>Successfully {actionText}! <a href={responseData.link} target="_blank" rel="noopener noreferrer">View Post</a></span>),
-                link: responseData.link,
-            };
+            const mediaData = await uploadResponse.json();
+            const newImageUrl = mediaData.source_url;
+            const newImgTag = image.fullImgTag.replace(/src="[^"]+"/, `src="${newImageUrl}" class="wp-image-${mediaData.id}"`);
+            contentWithWpImages = contentWithWpImages.replace(image.fullImgTag, newImgTag);
+
+            if (image.index === 0) {
+                featuredImageId = mediaData.id;
+            }
         } catch (error: any) {
-            return { success: false, message: `Error: ${error.message}` };
+            console.error('Image upload and conversion failed:', error);
+            return { success: false, message: `Image processing failed: ${error.message}` };
+        }
+    }
+
+    const postData: any = {
+        title: generatedContent.title,
+        content: contentWithWpImages + generateSchemaMarkup(generatedContent.jsonLdSchema),
+        status: status,
+        slug: generatedContent.slug,
+        meta: {
+            _yoast_wpseo_title: generatedContent.title,
+            _yoast_wpseo_metadesc: generatedContent.metaDescription,
+            rank_math_title: generatedContent.title,
+            rank_math_description: generatedContent.metaDescription,
         }
     };
+    if (featuredImageId) {
+        postData.featured_media = featuredImageId;
+    }
+
+    try {
+        let apiUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts`;
+        
+        // ✅ FIX: Better error handling for post lookup
+        if (itemToPublish.originalUrl) {
+            const slug = extractSlugFromUrl(itemToPublish.originalUrl);
+            console.log(`[Update] Looking up post with slug: "${slug}"`);
+            console.log(`[Update] Original URL: ${itemToPublish.originalUrl}`);
+            
+            const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id&status=publish,future,draft,pending,private`;
+            
+            const headers = new Headers({ 
+                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
+                'Content-Type': 'application/json'
+            });
+            
+            let lookupResponse;
+            try {
+                lookupResponse = await fetchWordPressWithRetry(lookupUrl, { headers });
+            } catch (fetchError: any) {
+                console.error('[Update] Fetch error during lookup:', fetchError);
+                return { 
+                    success: false, 
+                    message: `Connection failed while looking up post. Check that your WordPress site is accessible and the REST API is enabled. Error: ${fetchError.message}` 
+                };
+            }
+            
+            // ✅ Detailed error handling based on status code
+            if (!lookupResponse.ok) {
+                const errorText = await lookupResponse.text();
+                console.error(`[Update] Lookup failed with status ${lookupResponse.status}:`, errorText);
+                
+                if (lookupResponse.status === 401) {
+                    return { 
+                        success: false, 
+                        message: 'Authentication failed. Please check your WordPress username and application password in Step 1.' 
+                    };
+                }
+                
+                if (lookupResponse.status === 403) {
+                    return { 
+                        success: false, 
+                        message: 'Permission denied. Your WordPress user account may not have permission to edit posts.' 
+                    };
+                }
+                
+                if (lookupResponse.status === 404) {
+                    return { 
+                        success: false, 
+                        message: `The WordPress REST API endpoint was not found. Make sure your WordPress site has the REST API enabled and permalinks are set to "Post name" in Settings > Permalinks.` 
+                    };
+                }
+                
+                return { 
+                    success: false, 
+                    message: `Post lookup failed with HTTP ${lookupResponse.status}. Error: ${errorText.substring(0, 200)}` 
+                };
+            }
+            
+            const posts = await lookupResponse.json();
+            console.log(`[Update] Found ${posts.length} post(s) with slug "${slug}"`);
+            
+            if (posts.length > 0) {
+                const postId = posts[0].id;
+                console.log(`[Update] Updating post ID: ${postId}`);
+                apiUrl = `${apiUrl}/${postId}`;
+            } else {
+                return { 
+                    success: false, 
+                    message: (
+                        <span>
+                            Could not find a post with slug "{slug}" on your WordPress site. 
+                            The post may have been deleted, or the URL might be incorrect. 
+                            <br/><br/>
+                            Original URL: <code>{itemToPublish.originalUrl}</code>
+                            <br/>
+                            Extracted slug: <code>{slug}</code>
+                        </span>
+                    )
+                };
+            }
+        }
+
+        // ✅ Proceed with create/update
+        console.log(`[Publish] ${itemToPublish.originalUrl ? 'Updating' : 'Creating'} post at: ${apiUrl}`);
+        
+        const postResponse = await fetchWordPressWithRetry(apiUrl, {
+            method: 'POST',
+            headers: new Headers({
+                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
+                'Content-Type': 'application/json'
+            }),
+            body: JSON.stringify(postData)
+        });
+        
+        const responseData = await postResponse.json();
+        if (!postResponse.ok) {
+            console.error('[Publish] Post creation/update failed:', responseData);
+            throw new Error(responseData.message || `API returned status ${postResponse.status}`);
+        }
+        
+        const actionText = itemToPublish.originalUrl ? 'updated' : 'published';
+        console.log(`[Publish] Successfully ${actionText}:`, responseData.link);
+        
+        return {
+            success: true,
+            message: (<span>Successfully {actionText}! <a href={responseData.link} target="_blank" rel="noopener noreferrer">View Post</a></span>),
+            link: responseData.link,
+        };
+    } catch (error: any) {
+        console.error('[Publish] Fatal error:', error);
+        return { success: false, message: `Error: ${error.message}` };
+    }
+};
+
 
     return (
         <div className="app-container">
