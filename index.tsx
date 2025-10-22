@@ -4,6 +4,7 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import React, { useState, useMemo, useEffect, useCallback, useReducer, useRef, memo } from 'react';
 import ReactDOM from 'react-dom/client';
+import { generateFullSchema, generateSchemaMarkup, WpConfig } from './schema-generator';
 
 const AI_MODELS = {
     GEMINI_FLASH: 'gemini-2.5-flash',
@@ -171,17 +172,17 @@ const usedVideoUrls = new Set();
 // --- START: Performance & Caching Enhancements ---
 
 /**
- * UPGRADED: Dual-layer caching (in-memory + Supabase)
- * In-memory cache for instant access, Supabase for persistent cross-session caching
+ * A sophisticated caching layer for API responses to reduce redundant calls
+ * and improve performance within a session.
  */
 class ContentCache {
   private cache = new Map<string, {data: any, timestamp: number}>();
-  private TTL = 86400000; // 24 hours (upgraded from 1 hour)
-
+  private TTL = 3600000; // 1 hour
+  
   set(key: string, data: any) {
     this.cache.set(key, {data, timestamp: Date.now()});
   }
-
+  
   get(key: string): any | null {
     const item = this.cache.get(key);
     if (item && Date.now() - item.timestamp < this.TTL) {
@@ -193,13 +194,6 @@ class ContentCache {
   }
 }
 const apiCache = new ContentCache();
-
-// Stub for apiKeyManager
-const apiKeyManager = {
-    executeRequest: async (provider: string, fn: () => Promise<any>, options?: any) => {
-        return await fn();
-    }
-};
 
 // --- END: Performance & Caching Enhancements ---
 
@@ -1188,9 +1182,8 @@ const normalizeGeneratedContent = (parsedJson: any, itemTitle: string): Generate
     const normalized = { ...parsedJson };
 
     // --- Critical Fields ---
-    const safeItemTitle = itemTitle || 'untitled';
-    if (!normalized.title) normalized.title = safeItemTitle;
-    if (!normalized.slug) normalized.slug = safeItemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
+    if (!normalized.title) normalized.title = itemTitle;
+    if (!normalized.slug) normalized.slug = itemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
     if (!normalized.content) {
         console.warn(`[Normalization] 'content' field was missing for "${itemTitle}". Defaulting to empty string.`);
         normalized.content = '';
@@ -1198,8 +1191,8 @@ const normalizeGeneratedContent = (parsedJson: any, itemTitle: string): Generate
 
     // --- Image Details: The main source of errors ---
     if (!normalized.imageDetails || !Array.isArray(normalized.imageDetails) || normalized.imageDetails.length === 0) {
-        console.warn(`[Normalization] 'imageDetails' was missing or invalid for "${safeItemTitle}". Generating default image prompts.`);
-        const slugBase = normalized.slug || safeItemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
+        console.warn(`[Normalization] 'imageDetails' was missing or invalid for "${itemTitle}". Generating default image prompts.`);
+        const slugBase = normalized.slug || itemTitle.toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '');
         normalized.imageDetails = [
             {
                 prompt: `A high-quality, photorealistic image representing the concept of: "${normalized.title}". Cinematic, professional blog post header image, 16:9 aspect ratio.`,
@@ -1348,7 +1341,7 @@ Generate the complete JSON plan.
     - You MUST integrate the primary keyword at least once, and relevant semantic keywords naturally.
     - You MUST naturally integrate 1-2 internal link placeholders where contextually appropriate: \`[INTERNAL_LINK slug="example-slug" text="anchor text"]\`.
     - If writing for a section where a video will be embedded, provide a brief text summary of what the video covers.
-    - **E-E-A-T & CITATIONS:** Your writing MUST be backed by evidence. You MUST invent and insert citations from credible, but fictional, sources (academic journals, industry reports, government data). Use sequential, numeric in-text citations like \`[1]\`, \`[2]\`, etc. Each section should contain at least 1-2 unique citations to contribute to a total of 12+ for the article.
+    - **E-E-A-T & CITATIONS:** Your writing MUST be backed by evidence. 
 `,
         userPrompt: (primaryKeyword: string, articleTitle: string, sectionHeading: string, existingPages: any[] | null) => `
 **Primary Keyword:** "${primaryKeyword}"
@@ -1540,25 +1533,6 @@ Select the best sources from the provided search results and return them in the 
 
 **FINAL INSTRUCTION:** Your ENTIRE response MUST be ONLY the JSON object, starting with { and ending with }. Do not add any introductory text, closing remarks, or markdown code fences. Your output will be parsed directly by a machine.`,
         userPrompt: (content: string) => `Analyze the following blog post content and provide its SEO health score.\n\n&lt;content&gt;\n${content}\n&lt;/content&gt;`
-    },
-    batch_faq_generator: {
-        systemInstruction: `You are an expert content writer. Your task is to provide clear, concise answers to multiple FAQ questions in a single batch.
-
-**RULES:**
-1.  **JSON OUTPUT ONLY:** Your response MUST be a single, valid JSON array of objects.
-2.  **STYLE & FRESHNESS:** Each answer must be direct, easy to understand (Flesch-Kincaid score of 80+), and typically 2-4 sentences long. All information must be up-to-date (2025+). Follow the "ANTI-AI" writing style (simple words, active voice).
-3.  **FORMAT:** Return an array of objects: [{"question": "...", "answer": "<p>...</p>"}]`,
-        userPrompt: (questions: string[]) => `Answer all the following FAQ questions:\n\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`
-    },
-    synthesize_best_output: {
-        systemInstruction: `You are a master content synthesizer. Your task is to analyze multiple versions of the same content from different AI models and create a superior version that combines the best elements of each.
-
-**RULES:**
-1.  **SYNTHESIZE, DON'T COPY:** Don't just pick one version. Take the best ideas, phrasing, structure, and insights from ALL versions.
-2.  **MAINTAIN FORMAT:** Keep the same format and structure as the original versions.
-3.  **NO COMMENTARY:** Output only the synthesized content, no explanations.
-4.  **QUALITY FIRST:** The final output must be better than any individual input.`,
-        userPrompt: (context: string, versions: string[]) => `${context}\n\n${versions.map((v, i) => `=== VERSION ${i + 1} ===\n${v}\n`).join('\n')}`
     }
 };
 
@@ -2524,7 +2498,10 @@ const App = () => {
     // Step 1: API Keys & Config
     const [apiKeys, setApiKeys] = useState(() => {
         const saved = localStorage.getItem('apiKeys');
-        const initialKeys = saved ? JSON.parse(saved) : { geminiApiKey: '', openaiApiKey: '', anthropicApiKey: '', openrouterApiKey: '', serperApiKey: '', groqApiKey: '' };
+        const initialKeys = saved ? JSON.parse(saved) : { openaiApiKey: '', anthropicApiKey: '', openrouterApiKey: '', serperApiKey: '', groqApiKey: '' };
+        if (initialKeys.geminiApiKey) {
+            delete initialKeys.geminiApiKey;
+        }
         return initialKeys;
     });
     const [apiKeyStatus, setApiKeyStatus] = useState({ gemini: 'idle', openai: 'idle', anthropic: 'idle', openrouter: 'idle', serper: 'idle', groq: 'idle' } as Record<string, 'idle' | 'validating' | 'valid' | 'invalid'>);
@@ -2606,6 +2583,27 @@ const App = () => {
     useEffect(() => { localStorage.setItem('geoTargeting', JSON.stringify(geoTargeting)); }, [geoTargeting]);
     useEffect(() => { localStorage.setItem('siteInfo', JSON.stringify(siteInfo)); }, [siteInfo]);
 
+    useEffect(() => {
+        (async () => {
+            if (process.env.API_KEY) {
+                try {
+                    setApiKeyStatus(prev => ({...prev, gemini: 'validating' }));
+                    const geminiClient = new GoogleGenAI({ apiKey: process.env.API_KEY });
+                    await callAiWithRetry(() => geminiClient.models.generateContent({ model: AI_MODELS.GEMINI_FLASH, contents: 'test' }));
+                    setApiClients(prev => ({ ...prev, gemini: geminiClient }));
+                    setApiKeyStatus(prev => ({...prev, gemini: 'valid' }));
+                } catch (e) {
+                    console.error("Gemini client initialization/validation failed:", e);
+                    setApiClients(prev => ({ ...prev, gemini: null }));
+                    setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
+                }
+            } else {
+                console.error("Gemini API key (API_KEY environment variable) is not set.");
+                setApiClients(prev => ({ ...prev, gemini: null }));
+                setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
+            }
+        })();
+    }, []);
 
 
     useEffect(() => {
@@ -2810,11 +2808,6 @@ const App = () => {
             let client;
             let isValid = false;
             switch (provider) {
-                case 'gemini':
-                    client = new GoogleGenAI({ apiKey: key });
-                    await callAiWithRetry(() => client.models.generateContent({ model: AI_MODELS.GEMINI_FLASH, contents: 'test' }));
-                    isValid = true;
-                    break;
                 case 'openai':
                     client = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
                     await callAiWithRetry(() => client.models.list());
@@ -3336,64 +3329,34 @@ const App = () => {
     };
 
     const generateImageWithFallback = useCallback(async (prompt: string): Promise<string | null> => {
-        // 🚀 Try OpenAI with intelligent rate limiting
         if (apiClients.openai && apiKeyStatus.openai === 'valid') {
             try {
-                return await apiKeyManager.executeRequest(
-                    'openai',
-                    async () => {
-                        console.log("Attempting image generation with OpenAI DALL-E 3...");
-                        const openaiImgResponse = await callAiWithRetry(() =>
-                            apiClients.openai!.images.generate({
-                                model: AI_MODELS.OPENAI_DALLE3,
-                                prompt,
-                                n: 1,
-                                size: '1792x1024',
-                                response_format: 'b64_json'
-                            })
-                        );
-                        const base64Image = openaiImgResponse.data[0].b64_json;
-                        if (base64Image) {
-                            console.log("OpenAI image generation successful.");
-                            return `data:image/png;base64,${base64Image}`;
-                        }
-                        return null;
-                    },
-                    { estimatedTokens: 1000, model: AI_MODELS.OPENAI_DALLE3 }
-                );
+                console.log("Attempting image generation with OpenAI DALL-E 3...");
+                const openaiImgResponse = await callAiWithRetry(() => apiClients.openai!.images.generate({ model: AI_MODELS.OPENAI_DALLE3, prompt, n: 1, size: '1792x1024', response_format: 'b64_json' }));
+                const base64Image = openaiImgResponse.data[0].b64_json;
+                if (base64Image) {
+                    console.log("OpenAI image generation successful.");
+                    return `data:image/png;base64,${base64Image}`;
+                }
             } catch (error: any) {
                 console.warn("OpenAI image generation failed, falling back to Gemini.", error);
             }
         }
 
-        // 🚀 Fallback to Gemini with intelligent rate limiting
         if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
             try {
-                return await apiKeyManager.executeRequest(
-                    'gemini',
-                    async () => {
-                        console.log("Attempting image generation with Google Gemini Imagen...");
-                        const geminiImgResponse = await callAiWithRetry(() =>
-                            apiClients.gemini!.models.generateImages({
-                                model: AI_MODELS.GEMINI_IMAGEN,
-                                prompt: prompt,
-                                config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' }
-                            })
-                        );
-                        const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
-                        if (base64Image) {
-                            console.log("Gemini image generation successful.");
-                            return `data:image/jpeg;base64,${base64Image}`;
-                        }
-                        return null;
-                    },
-                    { estimatedTokens: 500, model: AI_MODELS.GEMINI_IMAGEN }
-                );
+                 console.log("Attempting image generation with Google Gemini Imagen...");
+                 const geminiImgResponse = await callAiWithRetry(() => apiClients.gemini!.models.generateImages({ model: AI_MODELS.GEMINI_IMAGEN, prompt: prompt, config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' } }));
+                 const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
+                 if (base64Image) {
+                    console.log("Gemini image generation successful.");
+                    return `data:image/jpeg;base64,${base64Image}`;
+                 }
             } catch (error: any) {
-                console.error("Gemini image generation also failed.", error);
+                 console.error("Gemini image generation also failed.", error);
             }
         }
-
+        
         console.error("All image generation services failed or are unavailable.");
         return null;
     }, [apiClients, apiKeyStatus]);
@@ -3408,23 +3371,16 @@ const App = () => {
         if (!client) throw new Error(`API Client for '${selectedModel}' not initialized.`);
 
         const template = PROMPT_TEMPLATES[promptKey];
-        const systemInstruction = (promptKey === 'cluster_planner')
+        const systemInstruction = (promptKey === 'cluster_planner') 
             ? template.systemInstruction.replace('{{GEO_TARGET_INSTRUCTIONS}}', (geoTargeting.enabled && geoTargeting.location) ? `All titles must be geo-targeted for "${geoTargeting.location}".` : '')
             : template.systemInstruction;
-
+            
         // @ts-ignore
         const userPrompt = template.userPrompt(...promptArgs);
+        
+        let responseText: string | null = '';
 
-        // 🚀 INTELLIGENT TOKEN ESTIMATION for rate limiting
-        const estimatedTokens = Math.ceil((systemInstruction.length + userPrompt.length) / 3);
-
-        // 🎯 WRAP API CALL WITH INTELLIGENT RATE LIMITING
-        return await apiKeyManager.executeRequest(
-            selectedModel,
-            async () => {
-                let responseText: string | null = '';
-
-                switch (selectedModel) {
+        switch (selectedModel) {
             case 'gemini':
                  const geminiConfig: { systemInstruction: string; responseMimeType?: string; tools?: any[] } = { systemInstruction };
                 if (responseFormat === 'json') {
@@ -3492,21 +3448,11 @@ const App = () => {
                 break;
         }
 
-                if (!responseText) {
-                    throw new Error(`AI returned an empty response for the '${promptKey}' stage.`);
-                }
+        if (!responseText) {
+            throw new Error(`AI returned an empty response for the '${promptKey}' stage.`);
+        }
 
-                return responseText;
-            },
-            {
-                estimatedTokens,
-                model: selectedModel === 'gemini' ? AI_MODELS.GEMINI_FLASH :
-                       selectedModel === 'openai' ? AI_MODELS.OPENAI_GPT4_TURBO :
-                       selectedModel === 'anthropic' ? AI_MODELS.ANTHROPIC_HAIKU :
-                       selectedModel,
-                maxRetries: 3
-            }
-        );
+        return responseText;
     }, [apiClients, selectedModel, geoTargeting, openrouterModels, selectedGroqModel, useGoogleSearch]);
 
 
@@ -3588,7 +3534,7 @@ const App = () => {
                     }, item.title);
 
                     finalContentPayload.content = processInternalLinks(finalContentPayload.content, existingPages);
-                    // finalContentPayload.jsonLdSchema = generateFullSchema(finalContentPayload, wpConfig, siteInfo, [], geoTargeting);
+                    finalContentPayload.jsonLdSchema = generateFullSchema(finalContentPayload, wpConfig, siteInfo, [], geoTargeting);
 
                     dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: finalContentPayload } });
 
@@ -3658,27 +3604,14 @@ const App = () => {
                 }
 
                 dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Analyzing Topic...' } });
-
-                // 🚀 DUAL-LAYER CACHING (in-memory + Supabase persistent)
                 const skCacheKey = `sk-${item.title}`;
-                semanticKeywords = apiCache.get(skCacheKey);
-
-                // if (!semanticKeywords) {
-                //     // Check Supabase persistent cache
-                //     semanticKeywords = await supabaseCache.get('semantic_keywords', { title: item.title });
-                // }
-
-                if (!semanticKeywords) {
-                    console.log('[CACHE] Generating new semantic keywords...');
+                if (apiCache.get(skCacheKey)) {
+                    semanticKeywords = apiCache.get(skCacheKey);
+                } else {
                     const skResponseText = await callAI('semantic_keyword_generator', [item.title], 'json');
                     const parsedSk = JSON.parse(extractJson(skResponseText));
                     semanticKeywords = parsedSk.semanticKeywords;
-
-                    // Store in both caches
                     apiCache.set(skCacheKey, semanticKeywords);
-                    // await supabaseCache.set('semantic_keywords', { title: item.title }, semanticKeywords, item.title);
-                } else {
-                    console.log('[CACHE] Using cached semantic keywords');
                 }
 
                 if (stopGenerationRef.current.has(item.id)) break;
@@ -3695,34 +3628,25 @@ const App = () => {
                 let contentParts: string[] = [];
                 contentParts.push(metaAndOutline.introduction);
                 
-                contentParts.push(generateEeatBoxHtml(siteInfo, item.title));
+                // contentParts.push(generateEeatBoxHtml(siteInfo, item.title));
                 
                 contentParts.push(`<h3>Key Takeaways</h3>\n<ul>\n${metaAndOutline.keyTakeaways.map((t: string) => `<li>${t}</li>`).join('\n')}\n</ul>`);
 
-                // 🚀 PARALLEL SECTION GENERATION (10x SPEED IMPROVEMENT)
                 const sections = metaAndOutline.outline;
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Writing ${sections.length} sections in parallel...` } });
-
-                console.log(`[PARALLEL] Generating ${sections.length} sections simultaneously...`);
-                const sectionPromises = sections.map((section: string, i: number) =>
-                    callAI('write_article_section', [item.title, metaAndOutline.title, section, existingPages], 'html')
-                        .then(html => ({ index: i, heading: section, html: sanitizeHtmlResponse(html) }))
-                );
-
-                const generatedSections = await Promise.all(sectionPromises);
-                console.log(`[PARALLEL] All ${sections.length} sections generated successfully!`);
-
-                // Add sections in order with videos interspersed
-                for (const section of generatedSections) {
+                for (let i = 0; i < sections.length; i++) {
                     if (stopGenerationRef.current.has(item.id)) break;
-
-                    contentParts.push(`<h2>${section.heading}</h2>${section.html}`);
-
+                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Writing section ${i + 1} of ${sections.length}...` } });
+                    
+                    let sectionContent = `<h2>${sections[i]}</h2>`;
+                    const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, sections[i], existingPages], 'html');
+                    sectionContent += sanitizeHtmlResponse(sectionHtml);
+                    contentParts.push(sectionContent);
+                    
                     if (youtubeVideos && youtubeVideos.length > 0) {
-                        if (section.index === 1 && youtubeVideos[0]) {
+                        if (i === 1 && youtubeVideos[0]) {
                             contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[0].embedUrl}" title="${youtubeVideos[0].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
                         }
-                        if (section.index === Math.floor(sections.length / 2) && youtubeVideos[1]) {
+                        if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) {
                             contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[1].embedUrl}" title="${youtubeVideos[1].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
                         }
                     }
@@ -3730,34 +3654,17 @@ const App = () => {
                 
                 contentParts.push(metaAndOutline.conclusion);
 
-                // 🚀 BATCH FAQ GENERATION (5x EFFICIENCY)
                 contentParts.push(`<div class="faq-section"><h2>Frequently Asked Questions</h2>`);
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Generating ${metaAndOutline.faqSection.length} FAQs in batch...` } });
-
-                console.log(`[BATCH] Generating ${metaAndOutline.faqSection.length} FAQ answers in one API call...`);
-                const faqQuestions = metaAndOutline.faqSection.map((f: any) => f.question);
-
-                try {
-                    const batchFaqResponse = await callAI('batch_faq_generator', [faqQuestions], 'json');
-                    const faqAnswers = JSON.parse(extractJson(batchFaqResponse));
-
-                    faqAnswers.forEach((faq: any) => {
-                        const cleanAnswer = sanitizeHtmlResponse(faq.answer).replace(/^<p>|<\/p>$/g, '');
-                        contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
-                        fullFaqData.push({ question: faq.question, answer: cleanAnswer });
-                    });
-                    console.log(`[BATCH] All ${faqAnswers.length} FAQ answers generated!`);
-                } catch (error) {
-                    console.warn('[BATCH] Batch FAQ failed, falling back to individual generation');
-                    // Fallback to individual generation
-                    for (let i = 0; i < metaAndOutline.faqSection.length; i++) {
-                        if (stopGenerationRef.current.has(item.id)) break;
-                        const faq = metaAndOutline.faqSection[i];
-                        const answerHtml = await callAI('write_faq_answer', [faq.question], 'html');
-                        const cleanAnswer = sanitizeHtmlResponse(answerHtml).replace(/^<p>|<\/p>$/g, '');
-                        contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
-                        fullFaqData.push({ question: faq.question, answer: cleanAnswer });
-                    }
+                
+                for (let i = 0; i < metaAndOutline.faqSection.length; i++) {
+                    if (stopGenerationRef.current.has(item.id)) break;
+                    const faq = metaAndOutline.faqSection[i];
+                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Answering FAQ ${i + 1} of ${metaAndOutline.faqSection.length}...` } });
+                    
+                    const answerHtml = await callAI('write_faq_answer', [faq.question], 'html');
+                    const cleanAnswer = sanitizeHtmlResponse(answerHtml).replace(/^<p>|<\/p>$/g, '');
+                    contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
+                    fullFaqData.push({ question: faq.question, answer: cleanAnswer });
                 }
                 contentParts.push(`</div>`);
 
@@ -3893,61 +3800,16 @@ const App = () => {
                 const minWords = isPillar ? TARGET_MIN_WORDS_PILLAR : TARGET_MIN_WORDS;
                 const maxWords = isPillar ? TARGET_MAX_WORDS_PILLAR : TARGET_MAX_WORDS;
                 enforceWordCount(finalContent, minWords, maxWords);
-                const humanScore = checkHumanWritingScore(finalContent);
-
-                // 🚀 COMPREHENSIVE QUALITY ANALYSIS & E-E-A-T SCORING
-                console.log('[QUALITY] Running comprehensive content quality analysis...');
-                // const qualityMetrics = analyzeContentQuality(
-                //     finalContent,
-                //     metaAndOutline.title,
-                //     metaAndOutline.primaryKeyword,
-                //     { model: selectedModel, topic: item.title }
-                // );
-                const qualityMetrics = { wordCount: 0, readabilityScore: 0, humanWritingScore: 0, eeatScore: { overall: 0 }, citationCount: 0, internalLinkCount: 0, keywordDensity: 0, passesQualityGate: true, failures: [] };
-
-                console.log(`[QUALITY REPORT]`);
-                console.log(`  ✓ Word Count: ${qualityMetrics.wordCount}`);
-                console.log(`  ✓ Readability: ${qualityMetrics.readabilityScore}/100`);
-                console.log(`  ✓ Human Writing: ${qualityMetrics.humanWritingScore}/100`);
-                console.log(`  ✓ E-E-A-T Score: ${qualityMetrics.eeatScore.overall}/100`);
-                console.log(`  ✓ Citations: ${qualityMetrics.citationCount}`);
-                console.log(`  ✓ Internal Links: ${qualityMetrics.internalLinkCount}`);
-                console.log(`  ✓ Keyword Density: ${qualityMetrics.keywordDensity}%`);
-
-                if (!qualityMetrics.passesQualityGate) {
-                    console.warn('[QUALITY] ⚠️  Content failed quality gate:');
-                    qualityMetrics.failures.forEach(f => console.warn(`  - ${f}`));
-                }
-
+                checkHumanWritingScore(finalContent);
+                
                 processedContent = normalizeGeneratedContent({
                     ...metaAndOutline,
                     content: finalContent,
                     imageDetails: updatedImageDetails,
                     serpData: serpData
                 }, item.title);
-
-                // processedContent.jsonLdSchema = generateFullSchema(processedContent, wpConfig, siteInfo, fullFaqData, geoTargeting);
-
-                // 💾 SAVE TO SUPABASE FOR ANALYTICS
-                console.log('[DB] Saving article to Supabase...');
-                // await saveGeneratedArticle({
-                //     title: processedContent.title,
-                //     slug: processedContent.slug,
-                //     content: processedContent.content,
-                //     metaDescription: processedContent.metaDescription,
-                //     primaryKeyword: processedContent.primaryKeyword,
-                //     semanticKeywords: processedContent.semanticKeywords,
-                //     wordCount: qualityMetrics.wordCount,
-                //     eeatScore: qualityMetrics.eeatScore.overall,
-                //     readabilityScore: qualityMetrics.readabilityScore,
-                //     humanWritingScore: qualityMetrics.humanWritingScore,
-                //     metadata: {
-                //         model: selectedModel,
-                //         qualityMetrics,
-                //         serpData: serpData ? serpData.slice(0, 3) : null,
-                //         generatedAt: new Date().toISOString()
-                //     }
-                // }).catch(err => console.warn('[DB] Failed to save article:', err));
+                
+                processedContent.jsonLdSchema = generateFullSchema(processedContent, wpConfig, siteInfo, fullFaqData, geoTargeting);
 
                 dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: processedContent } });
             
@@ -4039,7 +3901,7 @@ const App = () => {
 
         const postData: any = {
             title: generatedContent.title,
-            content: contentWithWpImages, // + generateSchemaMarkup(generatedContent.jsonLdSchema),
+            content: contentWithWpImages + generateSchemaMarkup(generatedContent.jsonLdSchema),
             status: status,
             slug: generatedContent.slug,
             meta: {
@@ -4130,7 +3992,14 @@ const App = () => {
                                     <h3>API Keys</h3>
                                     <div className="form-group">
                                         <label>Google Gemini API Key</label>
-                                        <ApiKeyInput provider="gemini" value={apiKeys.geminiApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.gemini} isEditing={editingApiKey === 'gemini'} onEdit={() => setEditingApiKey('gemini')} />
+                                        <div className="api-key-group">
+                                            <input type="text" readOnly value="Loaded from Environment" disabled />
+                                             <div className="key-status-icon">
+                                                {apiKeyStatus.gemini === 'validating' && <div className="key-status-spinner"></div>}
+                                                {apiKeyStatus.gemini === 'valid' && <span className="success"><CheckIcon /></span>}
+                                                {apiKeyStatus.gemini === 'invalid' && <span className="error"><XIcon /></span>}
+                                            </div>
+                                        </div>
                                     </div>
                                     <div className="form-group">
                                         <label>OpenAI API Key</label>
