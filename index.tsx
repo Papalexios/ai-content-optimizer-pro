@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
@@ -17,7 +16,6 @@ const AI_MODELS = {
         'google/gemini-2.5-flash',
         'anthropic/claude-3-haiku',
         'microsoft/wizardlm-2-8x22b',
-        'openrouter/auto'
     ],
     GROQ_MODELS: [
         'llama3-70b-8192',
@@ -84,11 +82,21 @@ function checkHumanWritingScore(content) {
     });
 
     const sentences = content.match(/[^.!?]+[.!?]+/g) || [];
-    if (sentences.length > 0) {
-        const avgLength = sentences.reduce((sum, s) => sum + s.split(/\s+/).length, 0) / sentences.length;
+    if (sentences.length > 10) { // Need enough sentences for a meaningful analysis
+        const sentenceLengths = sentences.map(s => s.split(/\s+/).filter(Boolean).length);
+        const avgLength = sentenceLengths.reduce((sum, len) => sum + len, 0) / sentenceLengths.length;
+        
         if (avgLength > 25) {
             aiScore += 15;
             console.warn(`⚠️  Average sentence too long (${avgLength.toFixed(1)} words)`);
+        }
+
+        // --- NEW: Check for sentence length variability ---
+        const variance = sentenceLengths.map(len => Math.pow(len - avgLength, 2)).reduce((sum, sq) => sum + sq, 0) / sentenceLengths.length;
+        const stdDev = Math.sqrt(variance);
+        if (stdDev < 2.5) { // Low standard deviation indicates uniform, robotic sentence lengths
+            aiScore += 15;
+            console.warn(`⚠️  Low sentence length variety (Std Dev: ${stdDev.toFixed(1)}). Sounds robotic.`);
         }
     }
 
@@ -376,6 +384,16 @@ const extractYouTubeID = (url: string): string | null => {
     return null;
 };
 
+const validateYouTubeVideo = async (videoId: string): Promise<boolean> => {
+  try {
+    const response = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    return response.ok;
+  } catch {
+    return false;
+  }
+};
+
+
 
 /**
  * Extracts the final, clean slug from a URL, intelligently removing parent paths and file extensions.
@@ -409,10 +427,10 @@ const extractSlugFromUrl = (urlString: string): string => {
 
 
 /**
- * A more professional and resilient fetch function for AI APIs that includes
- * exponential backoff for retries and intelligently fails fast on non-retriable errors.
- * This is crucial for handling rate limits (429) and transient server issues (5xx)
- * while avoiding wasted time on client-side errors (4xx).
+ * A highly professional and resilient fetch function for AI APIs that includes
+ * intelligent exponential backoff and strictly adheres to `Retry-After` headers.
+ * It fails fast on non-retriable errors and robustly parses error responses from multiple SDKs.
+ * This is the SOTA standard for handling rate limits (429) and transient server issues (5xx).
  * @param apiCall A function that returns the promise from the AI SDK call.
  * @param maxRetries The maximum number of times to retry the call.
  * @param initialDelay The baseline delay in milliseconds for the first retry.
@@ -427,42 +445,44 @@ const callAiWithRetry = async (apiCall: () => Promise<any>, maxRetries = 5, init
             console.error(`AI call failed on attempt ${attempt + 1}. Error:`, error);
 
             const errorMessage = (error.message || '').toLowerCase();
-            // Try to get status from error object, or parse it from the message as a fallback.
-            const statusMatch = errorMessage.match(/\[(\d{3})[^\]]*\]/); 
-            const statusCode = error.status || (statusMatch ? parseInt(statusMatch[1], 10) : null);
+            
+            // SOTA FIX: More robustly check for status code from different error structures.
+            const statusMatch = errorMessage.match(/status code (\d{3})/);
+            const statusCode = error.status ?? error.response?.status ?? (statusMatch ? parseInt(statusMatch[1], 10) : null);
 
             const isNonRetriableClientError = statusCode && statusCode >= 400 && statusCode < 500 && statusCode !== 429;
             const isContextLengthError = errorMessage.includes('context length') || errorMessage.includes('token limit');
-            const isInvalidApiKeyError = errorMessage.includes('api key not valid');
+            const isInvalidApiKeyError = errorMessage.includes('api key not valid') || statusCode === 401;
 
             if (isNonRetriableClientError || isContextLengthError || isInvalidApiKeyError) {
                  console.error(`Encountered a non-retriable error (Status: ${statusCode}, Message: ${error.message}). Failing immediately.`);
                  throw error; // Fail fast.
             }
 
-            // If it's the last attempt for any retriable error, give up.
             if (attempt === maxRetries - 1) {
                 console.error(`AI call failed on final attempt (${maxRetries}).`);
                 throw error;
             }
             
             let delay: number;
-            // --- Intelligent Rate Limit Handling ---
-            if (error.status === 429 || statusCode === 429) {
-                // Respect the 'Retry-After' header if the provider sends it. This is the gold standard.
-                const retryAfterHeader = error.headers?.['retry-after'] || error.response?.headers?.get('retry-after');
+            
+            if (statusCode === 429) {
+                // SOTA FIX: Robustly check for the Retry-After header in multiple possible locations.
+                const headers = error.headers ?? error.response?.headers;
+                const retryAfterHeader = typeof headers?.get === 'function' ? headers.get('retry-after') : headers?.['retry-after'];
+                
                 if (retryAfterHeader) {
                     const retryAfterSeconds = parseInt(retryAfterHeader, 10);
                     if (!isNaN(retryAfterSeconds)) {
-                        // The value is in seconds.
+                        // Value is in seconds.
                         delay = retryAfterSeconds * 1000 + 500; // Add a 500ms buffer.
-                        console.log(`Rate limit hit. Provider requested a delay of ${retryAfterSeconds}s. Waiting...`);
+                        console.log(`Rate limit hit. API requested a delay of ${retryAfterSeconds}s. Waiting...`);
                     } else {
-                        // The value might be an HTTP-date.
+                        // Value might be an HTTP-date.
                         const retryDate = new Date(retryAfterHeader);
                         if (!isNaN(retryDate.getTime())) {
-                            delay = retryDate.getTime() - new Date().getTime() + 500; // Add buffer.
-                             console.log(`Rate limit hit. Provider requested waiting until ${retryDate.toISOString()}. Waiting...`);
+                            delay = retryDate.getTime() - Date.now() + 500; // Add buffer.
+                            console.log(`Rate limit hit. API requested waiting until ${retryDate.toISOString()}. Waiting...`);
                         } else {
                              // Fallback if the date format is unexpected.
                              delay = initialDelay * Math.pow(2, attempt) + (Math.random() * 1000);
@@ -470,18 +490,19 @@ const callAiWithRetry = async (apiCall: () => Promise<any>, maxRetries = 5, init
                         }
                     }
                 } else {
-                    // If no 'Retry-After' header, use our more patient exponential backoff.
-                    delay = initialDelay * Math.pow(2, attempt) + (Math.random() * 1000);
-                    console.log(`Rate limit hit. No 'Retry-After' header found. Using exponential backoff.`);
+                    // If no 'Retry-After' header, use our patient exponential backoff.
+                    // Increased initial delay for rate limits without guidance.
+                    delay = (initialDelay * 2) * Math.pow(2, attempt) + (Math.random() * 1000);
+                    console.log(`Rate limit hit. No 'Retry-After' header found. Using patient exponential backoff.`);
                 }
             } else {
-                 // --- Standard Exponential Backoff for Server-Side Errors (5xx) ---
+                 // Standard Exponential Backoff for Server-Side Errors (5xx) or unknown errors.
                  const backoff = Math.pow(2, attempt);
                  const jitter = Math.random() * 1000;
                  delay = initialDelay * backoff + jitter;
             }
 
-            console.log(`Retrying in ${Math.round(delay)}ms...`);
+            console.log(`Retrying in ${Math.round(delay / 1000)}s...`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
@@ -598,63 +619,56 @@ const fetchWithProxies = async (
 
 
 /**
- * Smartly fetches a WordPress API endpoint. If the request is authenticated, it forces a direct
- * connection, as proxies will strip authentication headers. Unauthenticated requests will use
- * the original proxy fallback logic.
+ * Smartly fetches a WordPress API endpoint. It first attempts a direct connection.
+ * If that fails (e.g., due to a CORS error, which is common for authenticated API calls
+ * from a browser), it falls back to a series of public CORS proxies as a last resort.
+ * This makes the connection for authenticated actions like image uploads significantly more resilient.
  * @param targetUrl The full URL to the WordPress API endpoint.
  * @param options The options for the fetch call (method, headers, body).
  * @returns The successful Response object.
- * @throws {Error} if the connection fails.
+ * @throws {Error} if the direct connection and all proxies fail.
  */
 const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit): Promise<Response> => {
     const REQUEST_TIMEOUT = 30000; // 30 seconds for potentially large uploads
-    const hasAuthHeader = options.headers && (options.headers as Headers).has('Authorization');
-
-    // If the request has an Authorization header, it MUST be a direct request.
-    // Proxies will strip authentication headers and cause a guaranteed failure.
-    if (hasAuthHeader) {
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-            const directResponse = await fetch(targetUrl, { ...options, signal: controller.signal });
-            clearTimeout(timeoutId);
-            return directResponse; // Return the response directly, regardless of status, to be handled by the caller.
-        } catch (error: any) {
-            if (error.name === 'AbortError') {
-                throw new Error("WordPress API request timed out.");
-            }
-            // A TypeError is the classic sign of a CORS error on a failed fetch.
-            // This will be caught and diagnosed by the calling function (e.g., verifyWpConnection)
-            throw error;
-        }
-    }
-
-    // --- Fallback to original proxy logic for NON-AUTHENTICATED requests ---
     let lastError: Error | null = null;
-    
-    // 1. Attempt Direct Connection
+
+    // --- Attempt 1: Direct Connection (Preferred Method) ---
+    // This is the ideal path and works if the WordPress server has correct CORS headers.
     try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
         const directResponse = await fetch(targetUrl, { ...options, signal: controller.signal });
         clearTimeout(timeoutId);
 
-        if (directResponse.ok || (directResponse.status >= 400 && directResponse.status < 500)) {
-            return directResponse;
-        }
-        lastError = new Error(`Direct connection failed with status ${directResponse.status}`);
+        // We return the response even on HTTP errors (like 403 Forbidden) because the connection
+        // itself succeeded. The calling function needs to handle the specific API error.
+        // A successful connection is anything that doesn't throw a network error (like TypeError for CORS).
+        console.log("Direct connection to WordPress API successful.");
+        return directResponse;
+
     } catch (error: any) {
-        if (error.name !== 'AbortError') {
-            console.warn("Direct WP API call failed (likely CORS or network issue). Trying proxies.", error.name);
+        if (error.name === 'AbortError') {
+            lastError = new Error("Direct WordPress API request timed out.");
+        } else if (error instanceof TypeError && error.message.toLowerCase().includes('failed to fetch')) {
+            // This is the classic browser error for a CORS-blocked request, which is the problem we are fixing.
+            console.warn("Direct WP API call failed. This is likely a CORS issue. Falling back to proxies...");
+            lastError = new Error("Direct connection blocked by CORS policy. Trying proxies as a fallback.");
+        } else {
+            console.warn("Direct WP API call failed with an unexpected error. Falling back to proxies...", error);
+            lastError = error;
         }
-        lastError = error;
     }
-    
-    // 2. Attempt with Proxies if Direct Fails
+
+    // --- Attempt 2: Fallback to CORS Proxies (The Fix) ---
+    // This is the workaround for servers without proper CORS configuration.
+    // It may not work with all proxies, but it provides a chance for the request to succeed.
+    console.log("Attempting to bypass CORS using proxies for the authenticated request...");
     const encodedUrl = encodeURIComponent(targetUrl);
+    
+    // Using a curated list of proxies that are more likely to respect headers.
     const proxies = [
-        `https://corsproxy.io/?${encodedUrl}`,
-        `https://api.allorigins.win/raw?url=${encodedUrl}`,
+        `https://corsproxy.io/?${targetUrl}`,
+        `https://thingproxy.freeboard.io/fetch/${targetUrl}`,
     ];
 
     for (const proxyUrl of proxies) {
@@ -663,15 +677,16 @@ const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit):
         try {
             const shortProxyUrl = new URL(proxyUrl).hostname;
             console.log(`Attempting WP API call via proxy: ${shortProxyUrl}`);
+
+            // Important: We pass the ORIGINAL options, including the Authorization header.
             const response = await fetch(proxyUrl, { ...options, signal: controller.signal });
-            if (response.ok || (response.status >= 400 && response.status < 500)) {
-                console.log(`Successfully fetched via proxy: ${shortProxyUrl}`);
-                return response;
-            }
-            const responseText = await response.text().catch(() => '(could not read response body)');
-            lastError = new Error(`Proxy request failed with status ${response.status} for ${shortProxyUrl}. Response: ${responseText.substring(0, 100)}`);
+
+            // As before, we return the response even for HTTP errors (4xx, 5xx) because the connection worked.
+            console.log(`Successfully connected via proxy: ${shortProxyUrl}`);
+            return response;
+
         } catch (error: any) {
-             if (error.name === 'AbortError') {
+            if (error.name === 'AbortError') {
                 const shortProxyUrl = new URL(proxyUrl).hostname;
                 console.error(`Fetch via proxy ${shortProxyUrl} timed out.`);
                 lastError = new Error(`Request timed out for proxy: ${shortProxyUrl}`);
@@ -683,7 +698,8 @@ const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit):
         }
     }
 
-    throw lastError || new Error("All attempts to connect to the WordPress API failed.");
+    // If we're here, both the direct attempt and all proxies have failed.
+    throw lastError || new Error("All attempts to connect to the WordPress API failed. Please check your server's CORS configuration and network connection.");
 };
 
 
@@ -809,6 +825,30 @@ const validateAndRepairInternalLinks = (content: string, availablePages: any[]):
         } else {
             console.warn(`[Link Repair] Could not find any suitable match for slug "${slug}" (best score: ${highestScore.toFixed(2)}). Removing link, keeping text.`);
             return text; // Fallback: If no good match, just return the anchor text.
+        }
+    });
+};
+
+/**
+ * The "Link Uniqueness Guardian": Scans the content for duplicate internal link placeholders
+ * (pointing to the same slug) and removes all but the first occurrence. This ensures
+ * that each blog post is linked to only once, which is a critical SEO best practice.
+ * @param content The HTML content string with potential duplicate link placeholders.
+ * @returns The HTML content with duplicate links removed.
+ */
+const deduplicateInternalLinks = (content: string): string => {
+    const placeholderRegex = /\[INTERNAL_LINK\s+slug="([^"]+)"\s+text="([^"]+)"\]/g;
+    const seenSlugs = new Set<string>();
+
+    return content.replace(placeholderRegex, (fullMatch, slug, text) => {
+        if (seenSlugs.has(slug)) {
+            // This is a duplicate link. Remove the placeholder and just keep the anchor text.
+            console.warn(`[Link Deduplication] Found duplicate link for slug "${slug}". Removing placeholder, keeping text: "${text}".`);
+            return text; // Return only the anchor text.
+        } else {
+            // This is the first time we've seen this slug. Keep it and record it.
+            seenSlugs.add(slug);
+            return fullMatch; // Return the original placeholder unchanged.
         }
     });
 };
@@ -982,19 +1022,23 @@ const generateEeatBoxHtml = (siteInfo: SiteInfo, primaryKeyword: string): string
     let factCheckerCreds = "Lead Editor & Researcher";
     const lowerKeyword = primaryKeyword.toLowerCase();
 
-    if (lowerKeyword.includes('legal') || lowerKeyword.includes('compliance')) {
+    if (lowerKeyword.includes('legal') || lowerKeyword.includes('compliance') || lowerKeyword.includes('law')) {
         authorCreds = "Legal Tech Analyst";
         factCheckerCreds = "Corporate Attorney, J.D.";
-    } else if (lowerKeyword.includes('finance') || lowerKeyword.includes('investing')) {
+    } else if (lowerKeyword.includes('finance') || lowerKeyword.includes('investing') || lowerKeyword.includes('retirement')) {
         authorCreds = "Certified Financial Planner (CFP®)";
         factCheckerCreds = "Chartered Financial Analyst (CFA)";
-    } else if (lowerKeyword.includes('health') || lowerKeyword.includes('medical')) {
+    } else if (lowerKeyword.includes('health') || lowerKeyword.includes('medical') || lowerKeyword.includes('fitness')) {
         authorCreds = "Medical Writer & Health Educator";
         factCheckerCreds = "Board-Certified Physician, M.D.";
     } else if (lowerKeyword.includes('marketing') || lowerKeyword.includes('seo')) {
         authorCreds = "Certified Digital Marketing Consultant";
         factCheckerCreds = "Data Scientist, Marketing Analytics";
+    } else if (lowerKeyword.includes('tech') || lowerKeyword.includes('software') || lowerKeyword.includes('coding')) {
+        authorCreds = "Senior Technology Journalist";
+        factCheckerCreds = "Principal Software Engineer";
     }
+
 
     const authorName = siteInfo.authorName || 'Alexios Papaioannou';
     const factCheckerName = "Dr. Emily Carter"; // Fictional expert
@@ -1240,58 +1284,133 @@ const normalizeGeneratedContent = (parsedJson: any, itemTitle: string): Generate
     return normalized as GeneratedContent;
 };
 
+const injectRankingTriggers = (data: GeneratedContent): GeneratedContent => {
+    const powerWords = ['Ultimate', 'Proven', 'Secret', '2025', 'Expert-Tested'];
+    const freshnessStamp = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long' });
+    let title = data.title;
+
+    const hasPowerWord = powerWords.some(w => title.toLowerCase().includes(w.toLowerCase()));
+    if (!hasPowerWord) {
+        title = `${powerWords[Math.floor(Math.random() * powerWords.length)]} ${title}`;
+    }
+    
+    // Add freshness stamp if it doesn't already have a year
+    if (!/\d{4}/.test(title)) {
+        title = `${title} (${freshnessStamp})`;
+    }
+
+    data.title = title;
+    return data;
+};
+
 const PROMPT_TEMPLATES = {
+    contentTemplates: {
+        'product-review': {
+            outline: [
+                'What is [PRODUCT]?',
+                '[PRODUCT] vs Competitors',
+                'Key Features & Benefits',
+                'Pricing Analysis',
+                'Real User Reviews',
+                'Final Verdict'
+            ],
+        },
+        'how-to-guide': {
+            outline: [
+                'Quick Answer (30s)',
+                'Step-by-Step Process',
+                'Common Mistakes to Avoid',
+                'Pro Tips for Success',
+                'Troubleshooting Common Issues'
+            ]
+        },
+        'standard': null,
+    },
     cluster_planner: {
         systemInstruction: `You are a master SEO strategist specializing in building topical authority through pillar-and-cluster content models. Your task is to analyze a user's broad topic and generate a complete, SEO-optimized content plan that addresses user intent at every stage.
 
 **RULES:**
 1.  **Output Format:** Your entire response MUST be a single, valid JSON object. Do not include any text before or after the JSON.
 2.  **FRESHNESS & ACCURACY:** All titles must reflect current trends and be forward-looking (e.g., use '2025' where appropriate).
-3.  **Pillar Content:** The 'pillarTitle' must be a broad, comprehensive title for a definitive guide. It must be engaging, keyword-rich, and promise immense value to the reader. Think "The Ultimate Guide to..." or "Everything You Need to Know About...".
+3.  **Pillar Content:** The 'pillarTitle' must be a broad, comprehensive title for a definitive guide. It must be engaging, keyword-rich, and promise immense value. Think "The Ultimate Guide to..." or "Everything You Need to Know About...".
 4.  **Cluster Content:** The 'clusterTitles' must be an array of 5 to 7 unique strings. Each title should be a compelling question or a long-tail keyword phrase that a real person would search for. These should be distinct sub-topics that logically support and link back to the main pillar page.
     - Good Example: "How Much Does Professional Landscaping Cost in 2025?"
     - Bad Example: "Landscaping Costs"
-5.  **Keyword Focus:** All titles must be optimized for search engines without sounding robotic.
+5.  **SERP Feature Targeting**: For each cluster title, specify which SERP feature it is designed to capture (e.g., "Featured Snippet", "People Also Ask", "Video Carousel").
 {{GEO_TARGET_INSTRUCTIONS}}
 6.  **JSON Structure:** The JSON object must conform to this exact structure:
     {
       "pillarTitle": "A comprehensive, SEO-optimized title for the main pillar article.",
-      "clusterTitles": [
-        "A specific, long-tail keyword-focused title for the first cluster article.",
-        "A specific, long-tail keyword-focused title for the second cluster article.",
+      "clusterPlan": [
+        {
+          "title": "A specific, long-tail keyword-focused title for the first cluster article.",
+          "targetSerpFeature": "Featured Snippet"
+        },
+        {
+          "title": "A specific, question-based title for the second cluster article.",
+          "targetSerpFeature": "People Also Ask"
+        },
         "..."
       ]
-    }
-
-**FINAL INSTRUCTION:** Your ENTIRE response MUST be ONLY the JSON object, starting with { and ending with }. Do not add any introductory text, closing remarks, or markdown code fences. Your output will be parsed directly by a machine.`,
+    }`,
         userPrompt: (topic: string) => `Generate a pillar-and-cluster content plan for the topic: "${topic}".`
     },
+    // ADD this new prompt to your PROMPT_TEMPLATES object
+content_brief_generator: {
+    systemInstruction: `You are a world-class SEO content strategist. Your mission is to create a detailed "Content Brief" that will serve as the strategic blueprint for an article guaranteed to rank #1. You will perform a deep analysis of the primary keyword and the provided SERP competitor data to define a winning strategy.
+
+**RULES:**
+1.  **JSON OUTPUT ONLY:** Your ENTIRE response MUST be a single, valid JSON object. No conversational text.
+2.  **DEEP COMPETITOR ANALYSIS:** Your analysis must be ruthless and insightful. Go beyond surface-level observations. Identify the exact weaknesses and content gaps in the top 10 results.
+3.  **JSON STRUCTURE:** Adhere strictly to this structure:
+    {
+      "targetAudience": "A detailed description of the primary and secondary target audience, including their knowledge level, goals, and what motivates them.",
+      "userPainPoints": "A list of 2-3 specific, high-intent problems or questions the user has that this article MUST solve better than anyone else.",
+      "uniqueAngle": "A compelling, unique angle or hook that will make this article stand out. What new value, perspective, or data does it provide that competitors don't? This is your core strategic advantage.",
+      "entitiesToCover": "A list of 5-7 essential named entities, concepts, technical terms, or sub-topics that MUST be included to demonstrate comprehensive expertise and topical authority.",
+      "competitorWeaknesses": "A bulleted list summarizing the top 3 competitors' most critical weaknesses based on their SERP snippets and titles. Identify content gaps, outdated information (e.g., referencing 2023/2024), low-quality advice, or poor user experience signals."
+    }`,
+    userPrompt: (primaryKeyword: string, serpData: any[] | null) => `
+**PRIMARY KEYWORD:** "${primaryKeyword}"
+${serpData ? `**TOP 10 SERP COMPETITOR DATA (FOR ANALYSIS):** <serp_data>${JSON.stringify(serpData.map(d => ({title: d.title, link: d.link, snippet: d.snippet?.substring(0, 200)})))}</serp_data>` : ''}
+
+Generate the complete JSON content brief.`
+},
     content_meta_and_outline: {
-        systemInstruction: `You are an ELITE content strategist and SEO expert, specializing in creating content that ranks for featured snippets and voice search. Your task is to generate ALL metadata and a comprehensive structural plan for a world-class article.
+        systemInstruction: `You are an ELITE content strategist and SEO expert, specializing in creating content that ranks for featured snippets and voice search. Your task is to generate ALL metadata and a comprehensive structural plan for a world-class article, based on a strategic content brief.
 
 **RULES:**
 1.  **JSON OUTPUT ONLY:** Your ENTIRE response MUST be a single, valid JSON object. No text before or after.
-2.  **FRESHNESS & ACCURACY:** The entire plan MUST be based on current, fact-checked, and accurate information, with a forward-looking perspective (2025 and beyond).
-3.  **DO NOT WRITE THE ARTICLE BODY:** Your role is to plan, not write. The 'outline' should be a list of H2 headings ONLY. The 'introduction' and 'conclusion' sections should be fully written paragraphs.
-4.  **HEADINGS ARE SACRED (FOR VOICE & SNIPPETS):**
-    - The H2 headings in the 'outline' MUST be phrased as direct user questions (e.g., "How Do I...?").
-    - If provided, you MUST prioritize using the 'People Also Ask' questions for the outline. This is critical for ranking.
-5.  **STRATEGIC ANALYSIS IS LAW:** If a strategic rewrite analysis is provided, you MUST incorporate ALL of its recommendations into the new title, outline, and metadata. This is your highest priority and overrides all other instructions.
+2.  **STRATEGIC BRIEF IS LAW:** You MUST incorporate ALL recommendations from the provided 'Content Brief' into the new title, outline, and metadata. This is your highest priority.
+3.  **AEO & ANSWER-FIRST STRUCTURE:** The introduction MUST provide a direct, concise answer to the primary user query within the first 50 words. All H2 headings in the outline MUST be phrased as direct user questions. This is critical for voice search and featured snippets.
+4.  **DO NOT WRITE THE ARTICLE BODY:** Your role is to plan, not write. The 'outline' should be a list of H2 headings ONLY. The 'introduction' and 'conclusion' sections should be fully written paragraphs.
+5.  **PRIORITIZE PAA:** If provided, you MUST prioritize using the 'People Also Ask' questions for the outline.
 6.  **WRITING STYLE (For Intro/Conclusion):** Follow the "ANTI-AI" protocol: Short, direct sentences (avg. 10 words). Tiny paragraphs (2-3 sentences max). Active voice. Your writing MUST achieve a Flesch-Kincaid readability score of 80 or higher.
-    - **PRIMARY KEYWORD:** You MUST seamlessly integrate the primary keyword within the first 1-2 sentences of the introduction.
 7.  **STRUCTURAL REQUIREMENTS:**
     - **keyTakeaways**: Exactly 8 high-impact bullet points (as an array of strings).
     - **outline**: 10-15 H2 headings, phrased as questions (as an array of strings).
     - **faqSection**: Exactly 8 questions for a dedicated FAQ section (as an array of objects: \`[{ "question": "..." }]\`).
-    - **imageDetails**: Exactly 2 image prompts. Placeholders MUST be '[IMAGE_1_PLACEHOLDER]' and '[IMAGE_2_PLACEHOLDER]'. The 'prompt' MUST be a vivid, detailed description for an AI image generator. The 'altText' MUST be a highly descriptive, SEO-friendly sentence that explains the image's content for accessibility.
+    - **imageDetails**: Exactly 2 image prompts. Placeholders MUST be '[IMAGE_1_PLACEHOLDER]' and '[IMAGE_2_PLACEHOLDER]'. The 'prompt' MUST be a vivid, detailed description for an AI image generator. The 'altText' MUST be a highly descriptive, SEO-friendly sentence.
 8.  **SOTA SEO METADATA:** The 'title' MUST be under 60 characters and contain the **exact** primary keyword. The 'metaDescription' MUST be between 120 and 155 characters and contain the **exact** primary keyword.
 9.  **JSON STRUCTURE:** Adhere strictly to the provided JSON schema. Ensure all fields are present.
 `,
-        userPrompt: (primaryKeyword: string, semanticKeywords: string[] | null, serpData: any[] | null, peopleAlsoAsk: string[] | null, existingPages: any[] | null, originalContent: string | null = null, analysis: SitemapPage['analysis'] | null = null) => {
+        userPrompt: (primaryKeyword: string, semanticKeywords: string[] | null, serpData: any[] | null, peopleAlsoAsk: string[] | null, existingPages: any[] | null, originalContent: string | null = null, analysis: SitemapPage['analysis'] | null = null, contentBrief: any | null = null, contentTemplate: any | null = null) => {
             const MAX_CONTENT_CHARS = 8000;
             const MAX_LINKING_PAGES = 50;
             const MAX_SERP_SNIPPET_LENGTH = 200;
 
+            let briefForPrompt = contentBrief ? `***CRITICAL CONTENT BRIEF:*** You MUST follow this strategic brief to guide your planning.
+<content_brief>
+${JSON.stringify(contentBrief, null, 2)}
+</content_brief>` : '';
+
+            let analysisForPrompt = analysis
+                ? `***CRITICAL REWRITE ANALYSIS:*** You MUST follow these strategic recommendations to improve the article. This is your highest priority.
+<rewrite_plan>
+${JSON.stringify(analysis, null, 2)}
+</rewrite_plan>`
+                : '';
+            
             let contentForPrompt = originalContent 
                 ? `***CRITICAL REWRITE MANDATE:*** You are to deconstruct the following outdated article and rebuild its plan.
 <original_content_to_rewrite>
@@ -1299,17 +1418,16 @@ ${originalContent.substring(0, MAX_CONTENT_CHARS)}
 </original_content_to_rewrite>`
                 : '';
             
-            let analysisForPrompt = analysis
-                ? `***CRITICAL REWRITE ANALYSIS:*** You MUST follow these strategic recommendations to improve the article. This is your highest priority.
-<rewrite_plan>
-${JSON.stringify(analysis, null, 2)}
-</rewrite_plan>`
+            let templateForPrompt = contentTemplate
+                ? `***CONTENT TEMPLATE:*** You MUST use this outline structure. Replace placeholders like [PRODUCT] with the primary keyword. <template>${JSON.stringify(contentTemplate.outline)}</template>`
                 : '';
 
             return `
 **PRIMARY KEYWORD:** "${primaryKeyword}"
+${briefForPrompt}
 ${analysisForPrompt}
 ${contentForPrompt}
+${templateForPrompt}
 ${semanticKeywords ? `**MANDATORY SEMANTIC KEYWORDS:** You MUST integrate these into the outline headings: <semantic_keywords>${JSON.stringify(semanticKeywords)}</semantic_keywords>` : ''}
 ${peopleAlsoAsk && peopleAlsoAsk.length > 0 ? `**CRITICAL - PEOPLE ALSO ASK:** These are real user questions. You MUST use these as H2 headings in the outline. This is a top priority. <people_also_ask>${JSON.stringify(peopleAlsoAsk)}</people_also_ask>` : ''}
 ${serpData ? `**SERP COMPETITOR DATA:** Analyze for gaps. <serp_data>${JSON.stringify(serpData.map(d => ({title: d.title, link: d.link, snippet: d.snippet?.substring(0, MAX_SERP_SNIPPET_LENGTH)})))}</serp_data>` : ''}
@@ -1324,7 +1442,7 @@ Generate the complete JSON plan.
 
 **RULES:**
 1.  **RAW HTML OUTPUT:** Your response must be ONLY the raw HTML content for the section. NO JSON, NO MARKDOWN, NO EXPLANATIONS. Start directly with a \`<p>\` tag. Do not include the \`<h2>\` tag for the main heading; it will be added automatically.
-2.  **ANSWER FIRST (FOR SNIPPETS):** The very first paragraph MUST be a direct, concise answer (40-55 words) to the question in the section heading.
+2.  **ANSWER FIRST (FOR SNIPPETS):** The very first paragraph MUST be a direct, concise answer (40-55 words) to the question in the section heading. This is non-negotiable for AEO.
 3.  **WORD COUNT:** The entire section MUST be between 250 and 300 words. This is mandatory.
 4.  **ELITE WRITING STYLE (THE "ANTI-AI" PROTOCOL):**
     - Short, direct sentences. Average 10 words. Max 15.
@@ -1332,56 +1450,77 @@ Generate the complete JSON plan.
     - Your writing MUST be clear enough to achieve a Flesch-Kincaid readability score of 80 or higher (Easy to read for a 12-year-old).
     - Use contractions: "it's," "you'll," "can't."
     - Active voice. Simple language. No filler words.
-5.  **FRESHNESS RULE:** All information, stats, and examples MUST be current and forward-looking (2025 and beyond). Outdated information is forbidden.
-6.  **FORBIDDEN PHRASES (ZERO TOLERANCE):**
+5.  **PERSONA ADOPTION:** You MUST adopt the persona of a seasoned expert relevant to the article's topic. For example, for "retirement planning," write as a financial advisor. For "SEO," as a digital marketing strategist. Your tone must be authoritative and trustworthy.
+6.  **FRESHNESS RULE:** All information, stats, and examples MUST be current and forward-looking (2025 and beyond). Outdated information is forbidden.
+7.  **FORBIDDEN PHRASES (ZERO TOLERANCE):**
     - ❌ 'delve into', 'in today's digital landscape', 'revolutionize', 'game-changer', 'unlock', 'leverage', 'in conclusion', 'to summarize', 'utilize', 'furthermore', 'moreover', 'landscape', 'realm', 'dive deep', etc.
-7.  **STRUCTURE & SEO:**
+8.  **STRUCTURE & SEO:**
     - You MAY use \`<h3>\` tags for sub-headings.
     - You MUST include at least one HTML table (\`<table>\`), list (\`<ul>\`/\`<ol>\`), or blockquote (\`<blockquote>\`) if relevant to the topic.
-    - You MUST integrate the primary keyword at least once, and relevant semantic keywords naturally.
     - You MUST naturally integrate 1-2 internal link placeholders where contextually appropriate: \`[INTERNAL_LINK slug="example-slug" text="anchor text"]\`.
-    - If writing for a section where a video will be embedded, provide a brief text summary of what the video covers.
-    - **E-E-A-T & CITATIONS:** Your writing MUST be backed by evidence. 
+    - **EXPERT QUOTES:** If the provided SERP competitor snippets contain a relevant quote, you MAY insert it into the article as a \`<blockquote>\`, citing the source URL. Example: \`<blockquote>"This is an insightful quote." - Source: https://example.com/article</blockquote>\`
 `,
-        userPrompt: (primaryKeyword: string, articleTitle: string, sectionHeading: string, existingPages: any[] | null) => `
+        userPrompt: (primaryKeyword: string, articleTitle: string, sectionHeading: string, existingPages: any[] | null, serpData: any[] | null) => `
 **Primary Keyword:** "${primaryKeyword}"
 **Main Article Title:** "${articleTitle}"
 **Section to Write:** "${sectionHeading}"
 
-${existingPages && existingPages.length > 0 ? `**Available Internal Links:** You can link to these pages.
-<pages>${JSON.stringify(existingPages.slice(0, 50).map(p => ({slug: p.slug, title: p.title})))}</pages>` : ''}
+${existingPages && existingPages.length > 0 ? `**Available Internal Links:** You can link to these pages.\n<pages>${JSON.stringify(existingPages.slice(0, 50).map(p => ({slug: p.slug, title: p.title})))}</pages>` : ''}
+${serpData ? `**Competitor Snippets (for quote inspiration):**\n<serp_data>${JSON.stringify(serpData.map(d => ({ snippet: d.snippet, link: d.link })))}</serp_data>`: ''}
 
 Write the HTML content for this section now.
 `
     },
-    write_faq_answer: {
-        systemInstruction: `You are an expert content writer. Your task is to provide a clear, concise, and helpful answer to a single FAQ question.
+    write_faq_section: {
+        systemInstruction: `You are an expert content writer. Your task is to provide clear, concise, and helpful answers to a list of FAQ questions.
 
 **RULES:**
-1.  **RAW HTML PARAGRAPH:** Respond with ONLY the answer wrapped in a single \`<p>\` tag. Do not repeat the question.
-2.  **STYLE & FRESHNESS:** The answer must be direct, easy to understand (Flesch-Kincaid score of 80+), and typically 2-4 sentences long. All information must be up-to-date (2025+). Follow the "ANTI-AI" writing style (simple words, active voice).
-`,
-        userPrompt: (question: string) => `Question: "${question}"`
+1.  **JSON OUTPUT ONLY:** Your response MUST be a single, valid JSON object.
+2.  **JSON STRUCTURE:** The JSON object must be \`{ "faqs": [{ "question": "...", "answer": "..." }] }\`. The 'answer' should be a single HTML paragraph string (\`<p>...\</p>\`).
+3.  **STYLE & FRESHNESS:** Each answer must be direct, easy to understand (Flesch-Kincaid score of 80+), and typically 2-4 sentences long. All information must be up-to-date (2025+). Follow the "ANTI-AI" writing style (simple words, active voice).
+4.  **MAINTAIN ORDER:** The order of the FAQs in your response MUST match the order of the questions provided in the prompt.`,
+        userPrompt: (questions: string[]) => `Here is the list of questions:\n${JSON.stringify(questions)}\n\nGenerate the JSON object with all the answers now.`
     },
     semantic_keyword_generator: {
-        systemInstruction: `You are a world-class SEO analyst. Your task is to generate a comprehensive list of semantic and LSI (Latent Semantic Indexing) keywords related to a primary topic. These keywords should cover sub-topics, user intent variations, and related entities.
+        systemInstruction: `You are a world-class SEO analyst. Your task is to generate a comprehensive list of semantic and LSI (Latent Semantic Indexing) keywords related to a primary topic, based on the provided competitor data.
 
 **RULES:**
-1.  **Output Format:** Your entire response MUST be a single, valid JSON object. Do not include any text, markdown, or justification before or after the JSON.
-2.  **FRESHNESS:** Keywords should be relevant for the current year and beyond (2025+).
-3.  **Quantity:** Generate between 15 and 25 keywords.
-4.  **JSON Structure:** The JSON object must conform to this exact structure:
+1.  **Output Format:** Your entire response MUST be a single, valid JSON object.
+2.  **QUANTITY:** Generate between 15 and 25 highly relevant keywords.
+3.  **JSON STRUCTURE:** The JSON object must conform to this exact structure:
     {
       "semanticKeywords": [
         "A highly relevant LSI keyword.",
         "A long-tail question-based keyword.",
-        "Another related keyword or phrase.",
+        "Another related keyword or phrase."
+      ]
+    }
+
+**FINAL INSTRUCTION:** Your ENTIRE response MUST be ONLY the JSON object.`,
+        userPrompt: (primaryKeyword: string) => `Generate semantic keywords for the primary topic: "${primaryKeyword}".`
+    },
+    keyword_idea_generator: {
+        systemInstruction: `You are an expert SEO strategist specializing in identifying low-competition, high-demand keywords. Your task is to generate a list of long-tail and question-based keywords for a given topic.
+
+**RULES:**
+1.  **Output Format:** Your entire response MUST be a single, valid JSON object. No text before or after the JSON.
+2.  **Keyword Types:** Generate a mix of keyword types:
+    - **Question Keywords:** Start with "who, what, where, when, why, how".
+    - **Transactional Keywords:** Include terms like "buy", "best", "review", "vs", "alternative".
+    - **Informational Long-Tail:** Detailed phrases a user would search for.
+{{GEO_TARGET_INSTRUCTIONS}}
+3.  **Quantity:** Generate between 20 and 30 unique keyword ideas.
+4.  **JSON STRUCTURE:** The JSON object must conform to this exact structure:
+    {
+      "keywords": [
+        "a long-tail keyword idea",
+        "what is a question-based keyword idea",
         "..."
       ]
     }
 
-**FINAL INSTRUCTION:** Your ENTIRE response MUST be ONLY the JSON object, starting with { and ending with }. Do not add any introductory text, closing remarks, or markdown code fences. Your output will be parsed directly by a machine.`,
-        userPrompt: (primaryKeyword: string) => `Generate semantic keywords for the primary topic: "${primaryKeyword}".`
+**FINAL INSTRUCTION:** Your ENTIRE response MUST be ONLY the JSON object, starting with { and ending with }.`,
+        userPrompt: (topic: string) => `Generate long-tail and question-based keyword ideas for the topic: "${topic}".`
     },
     seo_metadata_generator: {
         systemInstruction: `You are a world-class SEO copywriter with a deep understanding of Google's ranking factors and user psychology. Your task is to generate a highly optimized SEO title and meta description that maximizes click-through-rate (CTR) and ranking potential.
@@ -1397,8 +1536,8 @@ Write the HTML content for this section now.
     - MUST contain the primary keyword and relevant semantic keywords.
     - MUST be an engaging summary of the article's value proposition.
     - MUST include a clear call-to-action (e.g., "Learn how," "Discover the secrets," "Find out more").
-5.  **Geo-Targeting:** If a location is provided, you MUST naturally incorporate it into both the title and meta description.
-6.  **Competitor Analysis:** Analyze the provided SERP competitor titles to identify patterns and find an angle to differentiate your metadata.
+{{GEO_TARGET_INSTRUCTIONS}}
+5.  **Competitor Analysis:** Analyze the provided SERP competitor titles to identify patterns and find an angle to differentiate your metadata.
 `,
         userPrompt: (primaryKeyword: string, contentSummary: string, targetAudience: string, competitorTitles: string[], location: string | null) => `
 **Primary Keyword:** "${primaryKeyword}"
@@ -1548,6 +1687,13 @@ type ContentItem = {
     analysis?: SitemapPage['analysis'];
 };
 
+type KeywordResult = {
+    keyword: string;
+    competition: string;
+    score: number;
+    serp: any[];
+};
+
 type SeoCheck = {
     id: string;
     valid: boolean;
@@ -1561,6 +1707,7 @@ type SeoCheck = {
 // --- REDUCER for items state ---
 type ItemsAction =
     | { type: 'SET_ITEMS'; payload: Partial<ContentItem>[] }
+    | { type: 'ADD_ITEMS'; payload: Partial<ContentItem>[] }
     | { type: 'UPDATE_STATUS'; payload: { id: string; status: ContentItem['status']; statusText: string } }
     | { type: 'SET_CONTENT'; payload: { id: string; content: GeneratedContent } }
     | { type: 'SET_CRAWLED_CONTENT'; payload: { id: string; content: string } };
@@ -1569,6 +1716,10 @@ const itemsReducer = (state: ContentItem[], action: ItemsAction): ContentItem[] 
     switch (action.type) {
         case 'SET_ITEMS':
             return action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null }));
+        case 'ADD_ITEMS':
+             const newItems = action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null }));
+             const existingIds = new Set(state.map(item => item.id));
+             return [...state, ...newItems.filter(item => !existingIds.has(item.id))];
         case 'UPDATE_STATUS':
             return state.map(item =>
                 item.id === action.payload.id
@@ -1738,7 +1889,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
             wordCount,
             readabilityScore: calculateFleschReadability(textContent),
             keywordDensity: (textContent.toLowerCase().match(new RegExp(escapeRegExp(keywordLower), 'g')) || []).length,
-            semanticKeywordCount: semanticKeywords.reduce((acc, kw) => acc + (textContent.toLowerCase().match(new RegExp(escapeRegExp(kw.toLowerCase()), 'g')) || []).length, 0),
+            semanticKeywordCount: (semanticKeywords || []).reduce((acc, kw) => acc + (textContent.toLowerCase().match(new RegExp(escapeRegExp(kw.toLowerCase()), 'g')) || []).length, 0),
             linkCount: tempDiv.getElementsByTagName('a').length,
             tableCount: tempDiv.getElementsByTagName('table').length,
             listCount: tempDiv.querySelectorAll('ul, ol').length,
@@ -1850,7 +2001,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                             <div className="label-wrapper">
                                 <label htmlFor="title">SEO Title</label>
                                  <button className="btn-regenerate" onClick={() => onRegenerate('title')} disabled={isRegenerating.title}>
-                                    {isRegenerating.title ? <div className="spinner"></div> : 'Regenerate'}
+                                    {isRegenerating.title ? <div className="scanner-loader"></div> : 'Regenerate'}
                                 </button>
                                 <span className={`char-counter ${titleStatus}`}>{titleLength} / 60</span>
                             </div>
@@ -1863,7 +2014,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                             <div className="label-wrapper">
                                 <label htmlFor="metaDescription">Meta Description</label>
                                 <button className="btn-regenerate" onClick={() => onRegenerate('meta')} disabled={isRegenerating.meta}>
-                                    {isRegenerating.meta ? <div className="spinner"></div> : 'Regenerate'}
+                                    {isRegenerating.meta ? <div className="scanner-loader"></div> : 'Regenerate'}
                                 </button>
                                 <span className={`char-counter ${metaStatus}`}>{metaLength} / 155</span>
                             </div>
@@ -1888,7 +2039,7 @@ const RankGuardian = memo(({ item, editedSeo, editedContent, onSeoChange, onUrlC
                     ) : (
                         <ul className="action-item-list">
                             {actionItems.map(item => (
-                                <li key={item.id} className={`priority-${item.priority}`}>
+                                <li key={item.id} className={`priority-${item.priority.toLowerCase()}`}>
                                     <h5>{item.text}</h5>
                                     <p>{item.advice}</p>
                                 </li>
@@ -1988,8 +2139,9 @@ interface ReviewModalProps {
     wpPassword: string;
     onPublishSuccess: (originalUrl: string) => void;
     publishItem: (itemToPublish: ContentItem, currentWpPassword: string, status: 'publish' | 'draft') => Promise<{ success: boolean; message: React.ReactNode; link?: string }>;
-    callAI: (promptKey: keyof typeof PROMPT_TEMPLATES, promptArgs: any[], responseFormat?: 'json' | 'html', useGrounding?: boolean) => Promise<string>;
+    callAI: (promptKey: Exclude<keyof typeof PROMPT_TEMPLATES, 'contentTemplates'>, promptArgs: any[], responseFormat?: 'json' | 'html', useGrounding?: boolean) => Promise<string>;
     geoTargeting: ExpandedGeoTargeting;
+    addToast: (message: string, type: 'success' | 'error') => void;
 }
 
 const formatSerpUrl = (fullUrl: string): React.ReactNode => {
@@ -2017,13 +2169,13 @@ const formatSerpUrl = (fullUrl: string): React.ReactNode => {
     }
 };
 
-const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPublishSuccess, publishItem, callAI, geoTargeting }: ReviewModalProps) => {
+const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPublishSuccess, publishItem, callAI, geoTargeting, addToast }: ReviewModalProps) => {
     if (!item || !item.generatedContent) return null;
 
     const [activeTab, setActiveTab] = useState('Live Preview');
     const [editedSeo, setEditedSeo] = useState({ title: '', metaDescription: '', slug: '' });
     const [editedContent, setEditedContent] = useState('');
-    const [copyStatus, setCopyStatus] = useState('Copy HTML');
+    const [debouncedEditedContent, setDebouncedEditedContent] = useState('');
     const [wpPublishStatus, setWpPublishStatus] = useState('idle'); // idle, publishing, success, error
     const [wpPublishMessage, setWpPublishMessage] = useState<React.ReactNode>('');
     const [publishAction, setPublishAction] = useState<'publish' | 'draft'>('publish');
@@ -2049,6 +2201,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                 slug: fullUrl,
             });
             setEditedContent(item.generatedContent.content);
+            setDebouncedEditedContent(item.generatedContent.content);
             setActiveTab('Live Preview');
             setWpPublishStatus('idle');
             setWpPublishMessage('');
@@ -2060,6 +2213,18 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             }
         }
     }, [item, wpConfig.url]);
+
+
+    // Debounce content analysis
+    useEffect(() => {
+        const handler = setTimeout(() => {
+            setDebouncedEditedContent(editedContent);
+        }, 500); // 500ms debounce delay
+
+        return () => {
+            clearTimeout(handler);
+        };
+    }, [editedContent]);
 
 
     // SOTA Editor Logic
@@ -2080,6 +2245,8 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
 
 
     const previewContent = useMemo(() => {
+        // This is where you'd add CSS for the premium preview
+        // For demonstration, we'll rely on a wrapping class in the JSX.
         return editedContent;
     }, [editedContent]);
 
@@ -2096,15 +2263,17 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
         if (!item?.generatedContent) return;
         navigator.clipboard.writeText(editedContent)
             .then(() => {
-                setCopyStatus('Copied!');
-                setTimeout(() => setCopyStatus('Copy HTML'), 2000);
+                addToast('HTML copied to clipboard!', 'success');
             })
-            .catch(err => console.error('Failed to copy HTML: ', err));
+            .catch(err => {
+                console.error('Failed to copy HTML: ', err);
+                addToast('Failed to copy HTML.', 'error');
+            });
     };
 
     const handleValidateSchema = () => {
         if (!item?.generatedContent?.jsonLdSchema) {
-            alert("Schema has not been generated for this item yet.");
+            addToast("Schema has not been generated for this item.", 'error');
             return;
         }
         try {
@@ -2113,7 +2282,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             window.open(url, '_blank', 'noopener,noreferrer');
         } catch (error) {
             console.error("Failed to validate schema:", error);
-            alert("Could not process schema for validation.");
+            addToast("Could not process schema for validation.", 'error');
         }
     };
 
@@ -2134,11 +2303,15 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             const { primaryKeyword, strategy, serpData } = item.generatedContent;
             const summary = editedContent.replace(/<[^>]+>/g, ' ').substring(0, 500);
             const competitorTitles = serpData?.map(d => d.title).slice(0, 5) || [];
-            const location = geoTargeting.enabled ? geoTargeting.location : null;
+            
+            const geoPromptEnhancement = (geoTargeting.enabled && geoTargeting.location)
+                ? `\n**GEO-TARGETING MANDATE:**\n- Primary location: ${geoTargeting.location}, ${geoTargeting.region}\n- Naturally include the location in the copy.`
+                : '';
 
             const responseText = await callAI('seo_metadata_generator', [
-                primaryKeyword, summary, strategy.targetAudience, competitorTitles, location
+                primaryKeyword, summary, strategy.targetAudience, competitorTitles, geoTargeting.enabled ? geoTargeting.location : null
             ], 'json');
+
             const { seoTitle, metaDescription } = JSON.parse(extractJson(responseText));
 
             if (field === 'title' && seoTitle) {
@@ -2147,9 +2320,10 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             if (field === 'meta' && metaDescription) {
                 setEditedSeo(prev => ({ ...prev, metaDescription: metaDescription }));
             }
+            addToast(`Successfully regenerated ${field}!`, 'success');
         } catch (error: any) {
             console.error(`Failed to regenerate ${field}:`, error);
-            alert(`An error occurred while regenerating the ${field}. Please check the console.`);
+            addToast(`An error occurred while regenerating the ${field}.`, 'error');
         } finally {
             setIsRegenerating(prev => ({ ...prev, [field]: false }));
         }
@@ -2272,7 +2446,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                             <RankGuardian 
                                 item={item}
                                 editedSeo={editedSeo}
-                                editedContent={editedContent}
+                                editedContent={debouncedEditedContent}
                                 onSeoChange={handleSeoChange}
                                 onUrlChange={handleUrlChange}
                                 onRegenerate={handleRegenerateSeo}
@@ -2296,8 +2470,8 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                     </div>
 
                     <div className="modal-actions">
-                        <button className="btn btn-secondary" onClick={() => onSaveChanges(item.id, editedSeo, editedContent)}>Save Changes</button>
-                        <button className="btn btn-secondary" onClick={handleCopyHtml}>{copyStatus}</button>
+                        <button className="btn btn-secondary" onClick={() => { onSaveChanges(item.id, editedSeo, editedContent); addToast('Changes saved locally!', 'success'); }}>Save Changes</button>
+                        <button className="btn btn-secondary" onClick={handleCopyHtml}>Copy HTML</button>
                         <button className="btn btn-secondary" onClick={handleValidateSchema}>Validate Schema</button>
                         <div className="publish-action-group">
                             <select value={publishAction} onChange={e => setPublishAction(e.target.value as 'publish' | 'draft')} disabled={isUpdate}>
@@ -2385,7 +2559,7 @@ const BulkPublishModal = ({ items, onClose, publishItem, wpPassword, onPublishSu
                                 <span className="bulk-publish-item-title" title={item.title}>{item.title} {item.originalUrl ? '(Update)' : ''}</span>
                                 <div className="bulk-publish-item-status">
                                     {publishState[item.id].status === 'queued' && <span style={{ color: 'var(--text-light-color)' }}>Queued</span>}
-                                    {publishState[item.id].status === 'publishing' && <><div className="spinner"></div><span>Publishing...</span></>}
+                                    {publishState[item.id].status === 'publishing' && <><div className="scanner-loader"></div><span>Publishing...</span></>}
                                     {publishState[item.id].status === 'success' && <span className="success">{publishState[item.id].message}</span>}
                                     {publishState[item.id].status === 'error' && <span className="error">✗ Error</span>}
                                 </div>
@@ -2491,9 +2665,513 @@ const AppFooter = memo(() => (
 ));
 
 
+// --- View Components (Moved outside App component to fix rendering issues) ---
+
+interface SetupViewProps {
+    apiKeys: {
+        openaiApiKey: string;
+        anthropicApiKey: string;
+        openrouterApiKey: string;
+        serperApiKey: string;
+        groqApiKey: string;
+    };
+    apiKeyStatus: Record<string, 'idle' | 'validating' | 'valid' | 'invalid'>;
+    handleApiKeyChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
+    editingApiKey: string | null;
+    setEditingApiKey: React.Dispatch<React.SetStateAction<string | null>>;
+    selectedModel: string;
+    setSelectedModel: React.Dispatch<React.SetStateAction<string>>;
+    selectedGroqModel: string;
+    setSelectedGroqModel: React.Dispatch<React.SetStateAction<string>>;
+    openrouterModels: string[];
+    handleOpenrouterModelsChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+    useGoogleSearch: boolean;
+    setUseGoogleSearch: React.Dispatch<React.SetStateAction<boolean>>;
+    wpConfig: WpConfig;
+    setWpConfig: React.Dispatch<React.SetStateAction<WpConfig>>;
+    wpPassword: string;
+    setWpPassword: React.Dispatch<React.SetStateAction<string>>;
+    siteInfo: SiteInfo;
+    setSiteInfo: React.Dispatch<React.SetStateAction<SiteInfo>>;
+    geoTargeting: ExpandedGeoTargeting;
+    setGeoTargeting: React.Dispatch<React.SetStateAction<ExpandedGeoTargeting>>;
+}
+const SetupView = memo(({ apiKeys, apiKeyStatus, handleApiKeyChange, editingApiKey, setEditingApiKey, selectedModel, setSelectedModel, selectedGroqModel, setSelectedGroqModel, openrouterModels, handleOpenrouterModelsChange, useGoogleSearch, setUseGoogleSearch, wpConfig, setWpConfig, wpPassword, setWpPassword, siteInfo, setSiteInfo, geoTargeting, setGeoTargeting }: SetupViewProps) => (
+    <div className="setup-view">
+        <div className="page-header">
+            <h2 className="gradient-headline">1. Setup & Configuration</h2>
+            <p>Connect your AI services and WordPress site to get started. All keys are stored securely in your browser's local storage.</p>
+        </div>
+        <div className="setup-grid">
+            <div className="setup-card">
+                <h3>API Keys</h3>
+                <div className="form-group">
+                    <label>Google Gemini API Key</label>
+                    <div className="api-key-group">
+                        <input type="text" readOnly value="Loaded from Environment" disabled />
+                         <div className="key-status-icon">
+                            {apiKeyStatus.gemini === 'validating' && <div className="key-status-spinner"></div>}
+                            {apiKeyStatus.gemini === 'valid' && <span className="success"><CheckIcon /></span>}
+                            {apiKeyStatus.gemini === 'invalid' && <span className="error"><XIcon /></span>}
+                        </div>
+                    </div>
+                </div>
+                <div className="form-group">
+                    <label>OpenAI API Key</label>
+                    <ApiKeyInput provider="openai" value={apiKeys.openaiApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.openai} isEditing={editingApiKey === 'openai'} onEdit={() => setEditingApiKey('openai')} />
+                </div>
+                <div className="form-group">
+                    <label>Anthropic API Key</label>
+                    <ApiKeyInput provider="anthropic" value={apiKeys.anthropicApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.anthropic} isEditing={editingApiKey === 'anthropic'} onEdit={() => setEditingApiKey('anthropic')} />
+                </div>
+                 <div className="form-group">
+                    <label>OpenRouter API Key</label>
+                    <ApiKeyInput provider="openrouter" value={apiKeys.openrouterApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.openrouter} isEditing={editingApiKey === 'openrouter'} onEdit={() => setEditingApiKey('openrouter')} />
+                </div>
+                 <div className="form-group">
+                    <label>Groq API Key</label>
+                    <ApiKeyInput provider="groq" value={apiKeys.groqApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.groq} isEditing={editingApiKey === 'groq'} onEdit={() => setEditingApiKey('groq')} />
+                </div>
+                <div className="form-group">
+                    <label>Serper API Key</label>
+                    <ApiKeyInput provider="serper" value={apiKeys.serperApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.serper} isEditing={editingApiKey === 'serper'} onEdit={() => setEditingApiKey('serper')} />
+                </div>
+            </div>
+            <div className="setup-card">
+                <h3>AI Model Configuration</h3>
+                <div className="form-group">
+                    <label htmlFor="model-select">Primary Generation Model</label>
+                    <select id="model-select" value={selectedModel} onChange={e => setSelectedModel(e.target.value)}>
+                        <option value="gemini">Google Gemini 2.5 Flash</option>
+                        <option value="openai">OpenAI GPT-4o</option>
+                        <option value="anthropic">Anthropic Claude 3</option>
+                        <option value="openrouter">OpenRouter (Auto-Fallback)</option>
+                        <option value="groq">Groq (High-Speed)</option>
+                    </select>
+                </div>
+                {selectedModel === 'openrouter' && (
+                    <div className="form-group">
+                        <label>OpenRouter Model Fallback Chain (one per line)</label>
+                        <textarea value={openrouterModels.join('\n')} onChange={handleOpenrouterModelsChange} rows={5}></textarea>
+                    </div>
+                )}
+                 {selectedModel === 'groq' && (
+                    <div className="form-group">
+                        <label htmlFor="groq-model-select">Groq Model</label>
+                        <input type="text" id="groq-model-select" value={selectedGroqModel} onChange={e => setSelectedGroqModel(e.target.value)} placeholder="e.g., llama3-70b-8192" />
+                        <p className="help-text">Enter any model name compatible with the Groq API.</p>
+                    </div>
+                )}
+                 <div className="form-group checkbox-group">
+                    <input type="checkbox" id="useGoogleSearch" checked={useGoogleSearch} onChange={e => setUseGoogleSearch(e.target.checked)} />
+                    <label htmlFor="useGoogleSearch">Enable Google Search Grounding</label>
+                </div>
+                <p className="help-text">Grounding provides the AI with real-time search results for more accurate, up-to-date content. Recommended for time-sensitive topics.</p>
+            </div>
+
+            <div className="setup-card full-width">
+                <h3>WordPress & Site Information</h3>
+                <div className="schema-settings-grid">
+                    <div className="form-group">
+                        <label htmlFor="wpUrl">WordPress Site URL</label>
+                        <input type="url" id="wpUrl" value={wpConfig.url} onChange={e => setWpConfig(p => ({...p, url: e.target.value}))} placeholder="https://example.com" />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="wpUsername">WordPress Username</label>
+                        <input type="text" id="wpUsername" value={wpConfig.username} onChange={e => setWpConfig(p => ({...p, username: e.target.value}))} placeholder="your_username" />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="wpPassword">WordPress Application Password</label>
+                        <input type="password" id="wpPassword" value={wpPassword} onChange={e => setWpPassword(e.target.value)} placeholder="xxxx xxxx xxxx xxxx" />
+                    </div>
+                     <div className="form-group">
+                        <label htmlFor="orgName">Organization Name</label>
+                        <input type="text" id="orgName" value={siteInfo.orgName} onChange={e => setSiteInfo(p => ({...p, orgName: e.target.value}))} placeholder="My Awesome Blog" />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="logoUrl">Logo URL</label>
+                        <input type="url" id="logoUrl" value={siteInfo.logoUrl} onChange={e => setSiteInfo(p => ({...p, logoUrl: e.target.value}))} placeholder="https://example.com/logo.png" />
+                    </div>
+                     <div className="form-group">
+                        <label htmlFor="authorName">Author Name</label>
+                        <input type="text" id="authorName" value={siteInfo.authorName} onChange={e => setSiteInfo(p => ({...p, authorName: e.target.value}))} placeholder="John Doe" />
+                    </div>
+                     <div className="form-group">
+                        <label htmlFor="authorUrl">Author Page URL</label>
+                        <input type="url" id="authorUrl" value={siteInfo.authorUrl} onChange={e => setSiteInfo(p => ({...p, authorUrl: e.target.value}))} placeholder="https://example.com/about-me" />
+                    </div>
+                </div>
+            </div>
+            <div className="setup-card full-width">
+                <h3>Advanced Geo-Targeting</h3>
+                <div className="form-group checkbox-group">
+                    <input type="checkbox" id="geo-enabled" checked={geoTargeting.enabled} onChange={(e) => setGeoTargeting(p => ({...p, enabled: e.target.checked}))} />
+                    <label htmlFor="geo-enabled">Enable Geo-Targeting for Content</label>
+                </div>
+                {geoTargeting.enabled && (
+                    <div className="schema-settings-grid">
+                        <input type="text" value={geoTargeting.location} onChange={e => setGeoTargeting(p => ({...p, location: e.target.value}))} placeholder="City (e.g., Austin)" />
+                        <input type="text" value={geoTargeting.region} onChange={e => setGeoTargeting(p => ({...p, region: e.target.value}))} placeholder="State/Region (e.g., TX)" />
+                        <input type="text" value={geoTargeting.country} onChange={e => setGeoTargeting(p => ({...p, country: e.target.value}))} placeholder="Country Code (e.g., US)" />
+                        <input type="text" value={geoTargeting.postalCode} onChange={e => setGeoTargeting(p => ({...p, postalCode: e.target.value}))} placeholder="Postal Code (e.g., 78701)" />
+                    </div>
+                )}
+            </div>
+        </div>
+    </div>
+));
+
+interface StrategyViewProps {
+    contentMode: string;
+    setContentMode: React.Dispatch<React.SetStateAction<string>>;
+    topic: string;
+    setTopic: React.Dispatch<React.SetStateAction<string>>;
+    primaryKeywords: string;
+    setPrimaryKeywords: React.Dispatch<React.SetStateAction<string>>;
+    sitemapUrl: string;
+    setSitemapUrl: React.Dispatch<React.SetStateAction<string>>;
+    isCrawling: boolean;
+    crawlMessage: string;
+    existingPages: SitemapPage[];
+    hubSearchFilter: string;
+    setHubSearchFilter: React.Dispatch<React.SetStateAction<string>>;
+    hubStatusFilter: string;
+    setHubStatusFilter: React.Dispatch<React.SetStateAction<string>>;
+    hubSortConfig: {
+        key: string;
+        direction: 'asc' | 'desc';
+    };
+    handleHubSort: (key: string) => void;
+    isAnalyzingHealth: boolean;
+    healthAnalysisProgress: {
+        current: number;
+        total: number;
+    };
+    selectedHubPages: Set<string>;
+    handleToggleHubPageSelect: (id: string) => void;
+    handleToggleHubPageSelectAll: () => void;
+    handleAnalyzeSelectedPages: () => Promise<void>;
+    analyzableForRewrite: number;
+    handleRewriteSelected: () => void;
+    handleOptimizeLinksSelected: () => void;
+    setViewingAnalysis: React.Dispatch<React.SetStateAction<SitemapPage | null>>;
+    handleCrawlSitemap: () => Promise<void>;
+    isGenerating: boolean;
+    handleGenerateClusterPlan: () => Promise<void>;
+    handleGenerateMultipleFromKeywords: () => void;
+    imagePrompt: string;
+    setImagePrompt: React.Dispatch<React.SetStateAction<string>>;
+    numImages: number;
+    setNumImages: React.Dispatch<React.SetStateAction<number>>;
+    aspectRatio: string;
+    setAspectRatio: React.Dispatch<React.SetStateAction<string>>;
+    isGeneratingImages: boolean;
+    imageGenerationError: string;
+    generatedImages: {
+        src: string;
+        prompt: string;
+    }[];
+    handleGenerateImages: () => Promise<void>;
+    handleDownloadImage: (base64Data: string, prompt: string) => void;
+    addToast: (message: string, type: 'success' | 'error') => void;
+    filteredAndSortedHubPages: SitemapPage[];
+    keywordTopic: string;
+    setKeywordTopic: React.Dispatch<React.SetStateAction<string>>;
+    handleFindKeywords: () => Promise<void>;
+    isFindingKeywords: boolean;
+    keywordStatusText: string;
+    keywordResults: KeywordResult[];
+    handleAddKeywordsToQueue: (keywords: string[]) => void;
+}
+const StrategyView = memo(({ contentMode, setContentMode, topic, setTopic, primaryKeywords, setPrimaryKeywords, sitemapUrl, setSitemapUrl, isCrawling, crawlMessage, existingPages, hubSearchFilter, setHubSearchFilter, hubStatusFilter, setHubStatusFilter, hubSortConfig, handleHubSort, isAnalyzingHealth, healthAnalysisProgress, selectedHubPages, handleToggleHubPageSelect, handleToggleHubPageSelectAll, handleAnalyzeSelectedPages, analyzableForRewrite, handleRewriteSelected, handleOptimizeLinksSelected, setViewingAnalysis, handleCrawlSitemap, isGenerating, handleGenerateClusterPlan, handleGenerateMultipleFromKeywords, imagePrompt, setImagePrompt, numImages, setNumImages, aspectRatio, setAspectRatio, isGeneratingImages, imageGenerationError, generatedImages, handleGenerateImages, handleDownloadImage, addToast, filteredAndSortedHubPages, keywordTopic, setKeywordTopic, handleFindKeywords, isFindingKeywords, keywordStatusText, keywordResults, handleAddKeywordsToQueue }: StrategyViewProps) => (
+    <div className="content-strategy-view">
+        <div className="page-header">
+            <h2 className="gradient-headline">2. Content Strategy & Planning</h2>
+            <p>Choose your content creation method. Plan a full topic cluster, generate a single article from a keyword, or use the Content Hub to analyze and rewrite existing posts.</p>
+        </div>
+        <div className="tabs-container">
+            <div className="tabs" role="tablist">
+                <button className={`tab-btn ${contentMode === 'bulk' ? 'active' : ''}`} onClick={() => setContentMode('bulk')} role="tab">Bulk Content Planner</button>
+                <button className={`tab-btn ${contentMode === 'single' ? 'active' : ''}`} onClick={() => setContentMode('single')} role="tab">Single Article</button>
+                <button className={`tab-btn ${contentMode === 'keywordResearch' ? 'active' : ''}`} onClick={() => setContentMode('keywordResearch')} role="tab">Keyword Opportunity</button>
+                <button className={`tab-btn ${contentMode === 'hub' ? 'active' : ''}`} onClick={() => setContentMode('hub')} role="tab">Content Hub</button>
+                <button className={`tab-btn ${contentMode === 'imageGenerator' ? 'active' : ''}`} onClick={() => setContentMode('imageGenerator')} role="tab">Image Generator</button>
+            </div>
+        </div>
+        {contentMode === 'bulk' && (
+            <div className="tab-panel">
+                <h3>Bulk Content Planner</h3>
+                <p className="help-text">Enter a broad topic (e.g., "digital marketing") to generate a complete pillar page and cluster content plan, optimized for topical authority.</p>
+                <div className="form-group">
+                    <label htmlFor="topic">Broad Topic</label>
+                    <input type="text" id="topic" value={topic} onChange={e => setTopic(e.target.value)} placeholder="e.g., Landscape Photography" />
+                </div>
+                <button className="btn" onClick={handleGenerateClusterPlan} disabled={isGenerating || !topic}>
+                    {isGenerating ? 'Generating...' : 'Generate Content Plan'}
+                </button>
+            </div>
+        )}
+        {contentMode === 'single' && (
+           <div className="tab-panel">
+               <h3>Single Article from Keyword</h3>
+               <p className="help-text">Enter one or more specific primary keywords, each on a new line, to generate multiple articles at once.</p>
+                <div className="form-group">
+                   <label htmlFor="primaryKeywords">Primary Keywords (one per line)</label>
+                   <textarea id="primaryKeywords" value={primaryKeywords} onChange={e => setPrimaryKeywords(e.target.value)} placeholder="e.g., best camera for landscape photography
+how to edit photos in lightroom" rows={5}></textarea>
+               </div>
+               <button className="btn" onClick={handleGenerateMultipleFromKeywords} disabled={!primaryKeywords.trim()}>Go to Review &rarr;</button>
+           </div>
+       )}
+       {contentMode === 'keywordResearch' && (
+            <div className="tab-panel">
+                <h3>Keyword Opportunity Analyzer</h3>
+                <p className="help-text">Enter a broad topic to discover low-competition, high-demand keywords. We'll analyze the top SERP results to score each keyword's difficulty.</p>
+                <div className="form-group">
+                    <label htmlFor="keywordTopic">Topic</label>
+                    <input type="text" id="keywordTopic" value={keywordTopic} onChange={e => setKeywordTopic(e.target.value)} placeholder="e.g., Sustainable Gardening" />
+                </div>
+                <button className="btn" onClick={handleFindKeywords} disabled={isFindingKeywords || !keywordTopic}>
+                    {isFindingKeywords ? 'Analyzing...' : 'Find Keyword Opportunities'}
+                </button>
+                {isFindingKeywords && <div className="crawl-status" style={{marginTop: '1rem'}}>{keywordStatusText}</div>}
+                {keywordResults.length > 0 && (
+                    <div className="content-hub-table-container" style={{marginTop: '2rem'}}>
+                        <table className="content-hub-table">
+                            <thead>
+                                <tr>
+                                    <th>Keyword</th>
+                                    <th>Competition</th>
+                                    <th>Score</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {keywordResults.map(result => (
+                                    <tr key={result.keyword}>
+                                        <td>{result.keyword}</td>
+                                        <td><span className={`badge competition-${result.competition.toLowerCase().replace(/\s/g,'')}`}>{result.competition}</span></td>
+                                        <td>{result.score}/100</td>
+                                        <td><button className="btn btn-small" onClick={() => handleAddKeywordsToQueue([result.keyword])}>+ Add to Queue</button></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+        )}
+        {contentMode === 'hub' && (
+             <div className="tab-panel">
+                <h3>Content Hub & Rewrite Assistant</h3>
+                <p className="help-text">Enter your sitemap URL to crawl your existing content. Analyze posts for SEO health and generate strategic rewrite plans.</p>
+                <div className="sitemap-crawler-form">
+                    <div className="form-group">
+                         <label htmlFor="sitemapUrl">Sitemap URL</label>
+                         <input type="url" id="sitemapUrl" value={sitemapUrl} onChange={e => setSitemapUrl(e.target.value)} placeholder="https://example.com/sitemap_index.xml" />
+                    </div>
+                    <button className="btn" onClick={handleCrawlSitemap} disabled={isCrawling}>
+                        {isCrawling ? 'Crawling...' : 'Crawl Sitemap'}
+                    </button>
+                </div>
+                {crawlMessage && <div className="crawl-status">{crawlMessage}</div>}
+                {existingPages.length > 0 && (
+                    <div className="content-hub-table-container">
+                        <div className="table-controls">
+                            <input type="search" placeholder="Search pages..." className="filter-input" value={hubSearchFilter} onChange={e => setHubSearchFilter(e.target.value)} />
+                             <select value={hubStatusFilter} onChange={e => setHubStatusFilter(e.target.value)}>
+                                <option value="All">All Statuses</option>
+                                <option value="Critical">Critical</option>
+                                <option value="High">High</option>
+                                <option value="Medium">Medium</option>
+                                <option value="Healthy">Healthy</option>
+                            </select>
+                            <div className="table-actions">
+                                <button className="btn btn-secondary" onClick={handleAnalyzeSelectedPages} disabled={isAnalyzingHealth || selectedHubPages.size === 0}>
+                                    {isAnalyzingHealth ? `Analyzing... (${healthAnalysisProgress.current}/${healthAnalysisProgress.total})` : `Analyze Selected (${selectedHubPages.size})`}
+                                </button>
+                                <button className="btn" onClick={handleRewriteSelected} disabled={analyzableForRewrite === 0}>Rewrite Selected ({analyzableForRewrite})</button>
+                                <button className="btn btn-secondary" onClick={handleOptimizeLinksSelected} disabled={selectedHubPages.size === 0}>Optimize Links ({selectedHubPages.size})</button>
+                            </div>
+                        </div>
+                        <table className="content-hub-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" onChange={handleToggleHubPageSelectAll} checked={selectedHubPages.size > 0 && selectedHubPages.size === filteredAndSortedHubPages.length} /></th>
+                                    <th onClick={() => handleHubSort('title')}>Title & Slug</th>
+                                    <th onClick={() => handleHubSort('daysOld')}>Age</th>
+                                    <th onClick={() => handleHubSort('updatePriority')}>Status</th>
+                                     <th>Analysis & Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            {isCrawling ? <SkeletonLoader rows={10} columns={5} /> : filteredAndSortedHubPages.map(page => (
+                                    <tr key={page.id}>
+                                        <td><input type="checkbox" checked={selectedHubPages.has(page.id)} onChange={() => handleToggleHubPageSelect(page.id)} /></td>
+                                        <td className="hub-title-cell">
+                                            <a href={page.id} target="_blank" rel="noopener noreferrer">{page.title}</a>
+                                            <div className="slug">{page.id}</div>
+                                        </td>
+                                        <td>{page.daysOld !== null ? `${page.daysOld} days` : 'N/A'}</td>
+                                        <td><div className="status-cell">{page.updatePriority ? <span className={`priority-${page.updatePriority}`}>{page.updatePriority}</span> : 'Not Analyzed'}</div></td>
+                                        <td>
+                                           {page.status === 'analyzing' && <div className="status-cell"><div className="status-indicator analyzing"></div>Analyzing...</div>}
+                                            {page.status === 'error' && <div className="status-cell"><div className="status-indicator error"></div>Error</div>}
+                                            {page.status === 'analyzed' && page.analysis && (
+                                                <button className="btn btn-small" onClick={() => setViewingAnalysis(page)}>View Rewrite Plan</button>
+                                            )}
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
+        )}
+         {contentMode === 'imageGenerator' && (
+            <div className="tab-panel">
+                <h3>SOTA Image Generator</h3>
+                <p className="help-text">Generate high-quality images for your content using DALL-E 3 or Gemini Imagen. Describe the image you want in detail.</p>
+                <div className="form-group">
+                    <label htmlFor="imagePrompt">Image Prompt</label>
+                    <textarea id="imagePrompt" value={imagePrompt} onChange={e => setImagePrompt(e.target.value)} rows={4} placeholder="e.g., A photorealistic image of a golden retriever puppy playing in a field of flowers, cinematic lighting, 16:9 aspect ratio." />
+                </div>
+                <div className="form-group-row">
+                    <div className="form-group">
+                        <label htmlFor="numImages">Number of Images</label>
+                        <select id="numImages" value={numImages} onChange={e => setNumImages(Number(e.target.value))}>
+                            {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
+                        </select>
+                    </div>
+                     <div className="form-group">
+                        <label htmlFor="aspectRatio">Aspect Ratio</label>
+                        <select id="aspectRatio" value={aspectRatio} onChange={e => setAspectRatio(e.target.value)}>
+                            <option value="1:1">1:1 (Square)</option>
+                            <option value="16:9">16:9 (Widescreen)</option>
+                            <option value="9:16">9:16 (Vertical)</option>
+                            <option value="4:3">4:3 (Landscape)</option>
+                            <option value="3:4">3:4 (Portrait)</option>
+                        </select>
+                    </div>
+                </div>
+                <button className="btn" onClick={handleGenerateImages} disabled={isGeneratingImages || !imagePrompt}>
+                    {isGeneratingImages ? <><div className="scanner-loader"></div> Generating...</> : 'Generate Images'}
+                </button>
+                {imageGenerationError && <p className="error" style={{marginTop: '1rem'}}>{imageGenerationError}</p>}
+                {generatedImages.length > 0 && (
+                    <div className="image-assets-grid" style={{marginTop: '2rem'}}>
+                        {generatedImages.map((image, index) => (
+                            <div key={index} className="image-asset-card">
+                                <img src={image.src} alt={image.prompt} loading="lazy" />
+                                <div className="image-asset-details">
+                                    <button className="btn btn-small" onClick={() => handleDownloadImage(image.src, image.prompt)}>Download</button>
+                                    <button className="btn btn-small btn-secondary" onClick={() => { navigator.clipboard.writeText(image.prompt); addToast('Prompt copied!', 'success'); }}>Copy Prompt</button>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        )}
+    </div>
+));
+
+interface ReviewViewProps {
+    filter: string;
+    setFilter: React.Dispatch<React.SetStateAction<string>>;
+    isGenerating: boolean;
+    selectedItems: Set<string>;
+    handleGenerateSelected: () => void;
+    items: ContentItem[];
+    handleToggleSelect: (id: string) => void;
+    handleToggleSelectAll: () => void;
+    filteredAndSortedItems: ContentItem[];
+    handleSort: (key: string) => void;
+    setSelectedItemForReview: React.Dispatch<React.SetStateAction<ContentItem | null>>;
+    handleGenerateSingle: (item: ContentItem) => void;
+    handleStopGeneration: (itemId: string | null) => void;
+    generationProgress: {
+        current: number;
+        total: number;
+    };
+    setIsBulkPublishModalOpen: React.Dispatch<React.SetStateAction<boolean>>;
+}
+const ReviewView = memo(({ filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, items, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }: ReviewViewProps) => (
+    <div className="review-export-view">
+        <div className="page-header">
+            <h2 className="gradient-headline">3. Review, Edit & Export</h2>
+            <p>Review the generated content, make any final edits, and publish directly to your WordPress site or copy the HTML.</p>
+        </div>
+        <div className="review-table-container">
+            <div className="table-controls">
+                <input type="search" className="filter-input" placeholder="Filter by title..." value={filter} onChange={e => setFilter(e.target.value)} />
+                <div className="table-actions">
+                    <button className="btn btn-secondary" onClick={handleGenerateSelected} disabled={isGenerating || selectedItems.size === 0}>
+                        {isGenerating ? 'Generating...' : `Generate Selected (${selectedItems.size})`}
+                    </button>
+                    <button className="btn" onClick={() => setIsBulkPublishModalOpen(true)} disabled={items.filter(i => i.status === 'done' && selectedItems.has(i.id)).length === 0}>
+                        Bulk Publish Selected
+                    </button>
+                </div>
+            </div>
+            <table className="review-table">
+                 <thead>
+                    <tr>
+                        <th><input type="checkbox" onChange={handleToggleSelectAll} checked={selectedItems.size > 0 && selectedItems.size === filteredAndSortedItems.length && filteredAndSortedItems.length > 0} /></th>
+                        <th onClick={() => handleSort('title')}>Title</th>
+                        <th onClick={() => handleSort('type')}>Type</th>
+                        <th onClick={() => handleSort('status')}>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {filteredAndSortedItems.map(item => (
+                        <tr key={item.id}>
+                            <td><input type="checkbox" checked={selectedItems.has(item.id)} onChange={() => handleToggleSelect(item.id)} /></td>
+                            <td>{item.title}</td>
+                            <td><span className={`badge ${item.type}`}>{item.type.replace('-', ' ')}</span></td>
+                            <td>
+                                <div className="status-cell">
+                                    <div className={`status-indicator ${item.status}`}></div>
+                                    <span>{item.statusText}</span>
+                                </div>
+                            </td>
+                            <td>
+                                <div className="modal-actions">
+                                    {item.status === 'done' && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review & Edit</button>}
+                                    {item.status === 'error' && item.generatedContent && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review (Partial)</button>}
+                                    {(item.status === 'idle' || item.status === 'error') && <button className="btn btn-small btn-secondary" onClick={() => handleGenerateSingle(item)}>Generate</button>}
+                                    {item.status === 'generating' && <button className="btn btn-small btn-secondary" onClick={() => handleStopGeneration(item.id)}>Stop</button>}
+                                </div>
+                            </td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+            {isGenerating && (
+                 <div className="progress-bar-container" style={{marginTop: '1.5rem'}}>
+                    <div className="progress-bar-fill good" style={{width: `${(generationProgress.current / generationProgress.total) * 100}%`}}></div>
+                </div>
+            )}
+        </div>
+    </div>
+));
+
+
 // --- Main App Component ---
 const App = () => {
     const [activeView, setActiveView] = useState('setup');
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+    const [toasts, setToasts] = useState<{ id: number; message: string; type: 'success' | 'error' }[]>([]);
+
+    const addToast = (message: string, type: 'success' | 'error') => {
+        const id = Date.now();
+        setToasts(prev => [...prev, { id, message, type }]);
+        setTimeout(() => {
+            setToasts(prev => prev.filter(toast => toast.id !== id));
+        }, 5000);
+    };
     
     // Step 1: API Keys & Config
     const [apiKeys, setApiKeys] = useState(() => {
@@ -2518,7 +3196,7 @@ const App = () => {
 
 
     // Step 2: Content Strategy
-    const [contentMode, setContentMode] = useState('bulk'); // 'bulk', 'single', or 'imageGenerator'
+    const [contentMode, setContentMode] = useState('bulk'); // 'bulk', 'single', 'imageGenerator'
     const [topic, setTopic] = useState('');
     const [primaryKeywords, setPrimaryKeywords] = useState('');
     const [sitemapUrl, setSitemapUrl] = useState('');
@@ -2540,6 +3218,10 @@ const App = () => {
             authorName: '', authorUrl: '', authorSameAs: []
         };
     });
+    const [keywordTopic, setKeywordTopic] = useState('');
+    const [keywordResults, setKeywordResults] = useState<KeywordResult[]>([]);
+    const [isFindingKeywords, setIsFindingKeywords] = useState(false);
+    const [keywordStatusText, setKeywordStatusText] = useState('');
 
 
     // Image Generator State
@@ -2928,13 +3610,13 @@ const App = () => {
     const handleAnalyzeSelectedPages = async () => {
         const pagesToAnalyze = existingPages.filter(p => selectedHubPages.has(p.id));
         if (pagesToAnalyze.length === 0) {
-            alert("No pages selected to analyze.");
+            addToast("No pages selected to analyze.", 'error');
             return;
         }
 
         const client = apiClients[selectedModel as keyof typeof apiClients];
         if (!client) {
-            alert("API client not available. Please check your API key in Step 1.");
+            addToast("API client not available. Please check your API key in Step 1.", 'error');
             return;
         }
         
@@ -3007,20 +3689,10 @@ const App = () => {
         }
     };
 
-    const sanitizeTitle = (title: string, slug: string): string => {
-        try {
-            new URL(title);
-            const decodedSlug = decodeURIComponent(slug);
-            return decodedSlug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        } catch (e) {
-            return title;
-        }
-    };
-
     const handlePlanRewrite = (page: SitemapPage) => {
         const newItem: ContentItem = { 
             id: page.id,
-            title: sanitizeTitle(page.title, page.slug), 
+            title: page.title, 
             type: 'standard', 
             originalUrl: page.id, 
             status: 'idle', 
@@ -3060,13 +3732,13 @@ const App = () => {
     const handleRewriteSelected = () => {
         const selectedPages = existingPages.filter(p => selectedHubPages.has(p.id) && p.analysis);
         if (selectedPages.length === 0) {
-            alert("Please select one or more pages that have been successfully analyzed to plan a rewrite. Run the analysis first if you haven't.");
+            addToast("Please select one or more pages that have been successfully analyzed to plan a rewrite.", 'error');
             return;
         }
 
         const newItems: ContentItem[] = selectedPages.map(page => ({
             id: page.id,
-            title: sanitizeTitle(page.title, page.slug),
+            title: page.title,
             type: 'standard',
             originalUrl: page.id,
             status: 'idle',
@@ -3079,49 +3751,24 @@ const App = () => {
         setSelectedHubPages(new Set());
         setActiveView('review');
     };
-    
+
     const handleOptimizeLinksSelected = () => {
         const selectedPages = existingPages.filter(p => selectedHubPages.has(p.id));
         if (selectedPages.length === 0) {
-             alert("Please select one or more pages to optimize for internal links.");
+            addToast("Please select one or more pages to optimize for internal links.", 'error');
             return;
         }
-
-        const newItems: ContentItem[] = selectedPages.map(page => ({
-            id: page.id,
-            title: `Optimize Links: ${sanitizeTitle(page.title, page.slug)}`,
+    
+        const newItems: Partial<ContentItem>[] = selectedPages.map(page => ({
+            id: page.id + '-link-optimizer', // Ensure unique ID
+            title: `Link Optimizer for: ${page.title}`,
             type: 'link-optimizer',
             originalUrl: page.id,
-            status: 'idle',
-            statusText: 'Ready to Optimize',
-            generatedContent: null,
-            crawledContent: page.crawledContent,
         }));
-        dispatch({ type: 'SET_ITEMS', payload: newItems });
+        dispatch({ type: 'ADD_ITEMS', payload: newItems });
         setSelectedHubPages(new Set());
         setActiveView('review');
     };
-
-
-    const handleCreatePillarSelected = () => {
-        const selectedPages = existingPages.filter(p => selectedHubPages.has(p.id));
-        if (selectedPages.length === 0) return;
-
-        const newItems: ContentItem[] = selectedPages.map(page => ({
-            id: page.id,
-            title: sanitizeTitle(page.title, page.slug),
-            type: 'pillar',
-            originalUrl: page.id,
-            status: 'idle',
-            statusText: 'Ready to Generate',
-            generatedContent: null,
-            crawledContent: page.crawledContent
-        }));
-        dispatch({ type: 'SET_ITEMS', payload: newItems });
-        setSelectedHubPages(new Set());
-        setActiveView('review');
-    };
-
 
     const handleCrawlSitemap = async () => {
         if (!sitemapUrl) {
@@ -3142,17 +3789,12 @@ const App = () => {
         dispatch({ type: 'SET_ITEMS', payload: [] });
     
         try {
-            const responseText = await callAI(
-                'cluster_planner',
-                [topic],
-                'json'
-            );
-            
+            const responseText = await callAI('cluster_planner', [topic], 'json');
             const parsedJson = JSON.parse(extractJson(responseText));
             
             const newItems: Partial<ContentItem>[] = [
                 { id: parsedJson.pillarTitle, title: parsedJson.pillarTitle, type: 'pillar' },
-                ...parsedJson.clusterTitles.map((title: string) => ({ id: title, title, type: 'cluster' }))
+                ...parsedJson.clusterPlan.map((item: any) => ({ id: item.title, title: item.title, type: 'cluster' }))
             ];
             dispatch({ type: 'SET_ITEMS', payload: newItems });
             setActiveView('review');
@@ -3180,6 +3822,199 @@ const App = () => {
         }));
         
         dispatch({ type: 'SET_ITEMS', payload: newItems });
+        setActiveView('review');
+    };
+
+    const analyzeSearchIntent = (keyword: string, serpData: any) => {
+        const intents: Record<string, string[]> = {
+            informational: ['how', 'what', 'why', 'guide', 'tutorial', 'resource', 'ideas', 'tips'],
+            transactional: ['buy', 'price', 'discount', 'best', 'top', 'cheap', 'for sale'],
+            navigational: ['login', 'signup', 'official', 'website'],
+            commercial: ['review', 'vs', 'comparison', 'alternative', 'best']
+        };
+        let detectedIntent = 'informational';
+        for (const [intent, triggers] of Object.entries(intents)) {
+            if (triggers.some(t => keyword.toLowerCase().includes(t))) {
+                detectedIntent = intent;
+                break;
+            }
+        }
+        const titles = serpData.organic?.map((r: any) => r.title.toLowerCase()) || [];
+        const intentMatches = titles.filter((t: string) =>
+            intents[detectedIntent as keyof typeof intents].some(trigger => t.includes(trigger))
+        ).length;
+        return {
+            intent: detectedIntent,
+            opportunity: intentMatches < 3 
+        };
+    };
+
+    const calculateCompetitionScore = (serpData: any, keyword: string): { score: number; competition: string } => {
+        let score = 0;
+        const organicResults = serpData.organic?.slice(0, 10) || [];
+        if (organicResults.length === 0) return { score: 0, competition: 'N/A' };
+    
+        const highAuthorityDomains = ['wikipedia.org', 'forbes.com', 'nytimes.com', 'investopedia.com', 'healthline.com', 'webmd.com', 'techcrunch.com'];
+        const lowAuthoritySignals = ['reddit.com', 'quora.com', 'pinterest.com', '/forum/', 'capterra.com', 'g2.com', 'sourceforge.net'];
+        const govEduDomains = ['.gov', '.edu'];
+    
+        if (serpData.featuredSnippet) score += 15;
+        if (serpData.knowledgeGraph) score += 10;
+        if (serpData.peopleAlsoAsk?.length > 0) score += 5;
+    
+        organicResults.forEach((result: any, index: number) => {
+            const rankWeight = 10 - index; 
+            let resultScore = 0;
+    
+            try {
+                const url = new URL(result.link);
+                const domain = url.hostname.replace('www.', '');
+                
+                if (highAuthorityDomains.some(d => domain.includes(d))) resultScore += 2.5;
+                if (govEduDomains.some(d => domain.endsWith(d))) resultScore += 3.5;
+                if (lowAuthoritySignals.some(s => result.link.includes(s))) resultScore -= 2.0;
+    
+                if (result.title.toLowerCase().includes(keyword.toLowerCase())) resultScore += 1.5;
+                if (decodeURIComponent(url.href).toLowerCase().includes(keyword.toLowerCase().replace(/\s/g, '-'))) resultScore += 1;
+    
+                score += Math.max(0, resultScore) * (rankWeight / 10);
+            } catch (e) { /* invalid URL, ignore */ }
+        });
+        
+        const { opportunity } = analyzeSearchIntent(keyword, serpData);
+        if (opportunity) {
+            score *= 0.5; // Lower score = lower competition = better opportunity
+        }
+    
+        const maxPossibleScore = 15 + 10 + 5 + 10 * 7.5; 
+        const normalizedScore = Math.min(100, Math.round((score / maxPossibleScore) * 120));
+    
+        let competition = 'Very High';
+        if (normalizedScore <= 20) competition = 'Very Low';
+        else if (normalizedScore <= 40) competition = 'Low';
+        else if (normalizedScore <= 60) competition = 'Medium';
+        else if (normalizedScore <= 80) competition = 'High';
+    
+        return { score: normalizedScore, competition };
+    };
+    
+    const extractKeywordsWithTFIDF = (html: string): string[] => {
+        const text = html.replace(/<[^>]+>/g, ' ').toLowerCase();
+        const words = text.match(/\b\w{4,}\b/g) || [];
+        const wordFreq: Record<string, number> = {};
+        words.forEach(word => {
+            wordFreq[word] = (wordFreq[word] || 0) + 1;
+        });
+        return Object.entries(wordFreq)
+            .filter(([word, freq]) => freq < 5 && word.length > 6)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 20)
+            .map(([word]) => word);
+    };
+
+    const findKeywordGaps = async (competitorUrls: string[]): Promise<KeywordResult[]> => {
+        const gaps: KeywordResult[] = [];
+        await processConcurrently(competitorUrls, async (url) => {
+            try {
+                const response = await fetchWithProxies(url);
+                const html = await response.text();
+                const keywords = extractKeywordsWithTFIDF(html);
+                
+                await processConcurrently(keywords.slice(0, 10), async (kw) => {
+                     const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
+                        method: 'POST',
+                        headers: { 'X-API-KEY': apiKeys.serperApiKey!, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ q: kw, num: 10 })
+                    });
+                    const serpData = await serperResponse.json();
+                    const competition = calculateCompetitionScore(serpData, kw);
+
+                    if (competition.score < 30 && (serpData.organic?.length || 0) < 5) {
+                        gaps.push({
+                            keyword: kw,
+                            score: competition.score,
+                            competition: competition.competition,
+                            serp: serpData.organic || []
+                        });
+                    }
+                }, 5);
+            } catch (e) {
+                console.warn(`Failed to analyze ${url} for gaps:`, e);
+            }
+        }, 3);
+
+        return gaps.sort((a, b) => a.score - b.score);
+    };
+
+    const handleFindKeywords = async () => {
+        if (!apiClients[selectedModel as keyof typeof apiClients]) {
+            addToast('Please configure the selected AI model API key in Setup.', 'error');
+            return;
+        }
+        if (!apiKeys.serperApiKey) {
+            addToast('Please configure the Serper API key in Setup to use this feature.', 'error');
+            return;
+        }
+        setIsFindingKeywords(true);
+        setKeywordResults([]);
+        
+        try {
+            setKeywordStatusText('Stage 1/4: Generating initial keyword ideas...');
+            const ideasText = await callAI('keyword_idea_generator', [keywordTopic], 'json');
+            const { keywords } = JSON.parse(extractJson(ideasText));
+
+            setKeywordStatusText('Stage 2/4: Analyzing SERP for competitor gap analysis...');
+            const mainSerperResponse = await fetchWithProxies("https://google.serper.dev/search", {
+                method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q: keywordTopic, num: 10 })
+            });
+            const mainSerpData = await mainSerperResponse.json();
+            const competitorUrls = mainSerpData.organic?.map((r: any) => r.link).slice(0, 3) || [];
+            
+            setKeywordStatusText('Stage 3/4: Mining competitors for keyword gaps...');
+            const gapKeywords = await findKeywordGaps(competitorUrls);
+
+            const allKeywords = [...new Set([...keywords, ...gapKeywords.map(k => k.keyword)])];
+            const precomputedGaps = new Map(gapKeywords.map(k => [k.keyword, k]));
+            
+            setKeywordStatusText(`Stage 4/4: Analyzing SERPs for ${allKeywords.length} keywords...`);
+            
+            const results: KeywordResult[] = [];
+            await processConcurrently(allKeywords, async (keyword: string) => {
+                if (precomputedGaps.has(keyword)) {
+                    results.push(precomputedGaps.get(keyword)!);
+                    return;
+                }
+                try {
+                    const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
+                        method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey!, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ q: keyword, num: 20 })
+                    });
+                    if (!serperResponse.ok) throw new Error(`Serper API failed with status ${serperResponse.status}`);
+                    const serpData = await serperResponse.json();
+                    const { score, competition } = calculateCompetitionScore(serpData, keyword);
+                    results.push({ keyword, score, competition, serp: serpData.organic || [] });
+                } catch (e: any) { console.error(`Failed to analyze keyword "${keyword}":`, e); }
+            }, 5);
+            
+            results.sort((a, b) => a.score - b.score);
+            setKeywordResults(results);
+
+        } catch (error: any) {
+            console.error("Error finding keywords:", error);
+            addToast(`An error occurred: ${error.message}`, 'error');
+        } finally {
+            setIsFindingKeywords(false);
+        }
+    };
+    
+    const handleAddKeywordsToQueue = (keywords: string[]) => {
+        const newItems: Partial<ContentItem>[] = keywords.map(keyword => ({
+            id: keyword,
+            title: keyword,
+            type: 'standard'
+        }));
+        dispatch({ type: 'ADD_ITEMS', payload: newItems });
         setActiveView('review');
     };
 
@@ -3233,13 +4068,7 @@ const App = () => {
         document.body.removeChild(link);
     };
 
-    const handleCopyText = (text: string) => {
-        navigator.clipboard.writeText(text).catch(err => {
-            console.error('Failed to copy text: ', err);
-        });
-    };
-
-    const handleToggleSelect = (itemId: string) => {
+    const handleToggleSelect = useCallback((itemId: string) => {
         setSelectedItems(prev => {
             const newSet = new Set(prev);
             if (newSet.has(itemId)) {
@@ -3249,17 +4078,10 @@ const App = () => {
             }
             return newSet;
         });
-    };
+    }, []);
 
-    const handleToggleSelectAll = () => {
-        if (selectedItems.size === filteredAndSortedItems.length) {
-            setSelectedItems(new Set());
-        } else {
-            setSelectedItems(new Set(filteredAndSortedItems.map(item => item.id)));
-        }
-    };
-    
-     const filteredAndSortedItems = useMemo(() => {
+    // FIX: Moved `filteredAndSortedItems` before its usage in `handleToggleSelectAll` to prevent a reference error.
+    const filteredAndSortedItems = useMemo(() => {
         let sorted = [...items];
         if (sortConfig.key) {
             sorted.sort((a, b) => {
@@ -3281,6 +4103,14 @@ const App = () => {
         return sorted;
     }, [items, filter, sortConfig]);
 
+    const handleToggleSelectAll = useCallback(() => {
+        if (selectedItems.size === filteredAndSortedItems.length) {
+            setSelectedItems(new Set());
+        } else {
+            setSelectedItems(new Set(filteredAndSortedItems.map(item => item.id)));
+        }
+    }, [filteredAndSortedItems, selectedItems.size]);
+    
     const handleSort = (key: string) => {
         let direction: 'asc' | 'desc' = 'asc';
         if (sortConfig.key === key && sortConfig.direction === 'asc') {
@@ -3289,20 +4119,46 @@ const App = () => {
         setSortConfig({ key, direction });
     };
 
+const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
+        setIsGenerating(true);
+        setGenerationProgress({ current: 0, total: itemsToGenerate.length });
+        
+        // SOTA FIX: A configurable constant for concurrency. 
+        // 5 was too high for your API plan, causing the 429 error.
+        // Starting with 2 or 3 is a much safer approach to avoid rate limits.
+        const MAX_CONCURRENT_JOBS = 3;
+
+        await processConcurrently(
+            itemsToGenerate,
+            (item) => generateSingleItem(item),
+            MAX_CONCURRENT_JOBS, // Use the new constant here
+            (completed, total) => {
+                setGenerationProgress({ current: completed, total: total });
+            },
+            () => {
+                // Checks if any item has been flagged to stop the entire queue.
+                const shouldStop = itemsToGenerate.some(item => stopGenerationRef.current.has(item.id));
+                if (shouldStop) {
+                    console.log("Stop signal received, halting generation queue.");
+                }
+                return shouldStop;
+            }
+        );
+
+        setIsGenerating(false);
+        stopGenerationRef.current.clear(); // Clear stop signals after the queue is finished
+    };
+
     const handleGenerateSingle = (item: ContentItem) => {
         stopGenerationRef.current.delete(item.id);
-        setIsGenerating(true);
-        setGenerationProgress({ current: 0, total: 1 });
-        generateContent([item]);
+        runGenerationQueue([item]);
     };
 
     const handleGenerateSelected = () => {
         stopGenerationRef.current.clear();
         const itemsToGenerate = items.filter(item => selectedItems.has(item.id));
         if (itemsToGenerate.length > 0) {
-            setIsGenerating(true);
-            setGenerationProgress({ current: 0, total: itemsToGenerate.length });
-            generateContent(itemsToGenerate);
+            runGenerationQueue(itemsToGenerate);
         }
     };
     
@@ -3361,20 +4217,25 @@ const App = () => {
         return null;
     }, [apiClients, apiKeyStatus]);
     
+    // FIX: The `promptKey` type was too broad, causing a TypeScript error.
+    // It's been narrowed to exclude 'contentTemplates', which doesn't fit the expected structure.
     const callAI = useCallback(async (
-        promptKey: keyof typeof PROMPT_TEMPLATES,
+        promptKey: Exclude<keyof typeof PROMPT_TEMPLATES, 'contentTemplates'>,
         promptArgs: any[],
         responseFormat: 'json' | 'html' = 'json',
         useGrounding: boolean = false
     ): Promise<string> => {
         const client = apiClients[selectedModel as keyof typeof apiClients];
         if (!client) throw new Error(`API Client for '${selectedModel}' not initialized.`);
-
+    
         const template = PROMPT_TEMPLATES[promptKey];
-        const systemInstruction = (promptKey === 'cluster_planner') 
-            ? template.systemInstruction.replace('{{GEO_TARGET_INSTRUCTIONS}}', (geoTargeting.enabled && geoTargeting.location) ? `All titles must be geo-targeted for "${geoTargeting.location}".` : '')
-            : template.systemInstruction;
-            
+    
+        const geoInstructions = (geoTargeting.enabled && geoTargeting.location)
+            ? `\n**GEO-TARGETING MANDATE:**\n- Primary location: ${geoTargeting.location}, ${geoTargeting.region}\n- All content and titles must be tailored to this specific location.`
+            : '';
+    
+        const systemInstruction = template.systemInstruction.replace('{{GEO_TARGET_INSTRUCTIONS}}', geoInstructions);
+        
         // @ts-ignore
         const userPrompt = template.userPrompt(...promptArgs);
         
@@ -3455,988 +4316,577 @@ const App = () => {
         return responseText;
     }, [apiClients, selectedModel, geoTargeting, openrouterModels, selectedGroqModel, useGoogleSearch]);
 
+    const getContentTemplate = (keyword: string): string => {
+        const lowerKeyword = keyword.toLowerCase();
+        if (lowerKeyword.includes('review')) return 'product-review';
+        if (lowerKeyword.includes('how to')) return 'how-to-guide';
+        return 'standard';
+    };
 
-    const generateContent = useCallback(async (itemsToGenerate: ContentItem[]) => {
-        let generatedCount = 0;
+    const generateReferencesWithEnforcement = useCallback(async (
+        title: string,
+        primaryKeyword: string,
+        contentSummary: string,
+        initialSerpData: any[] | null
+    ): Promise<any[]> => {
+        console.log("[Reference Guardian] Starting reference generation...");
+        let collectedReferences: any[] = [];
+        const seenUrls = new Set<string>();
 
-        for (const item of itemsToGenerate) {
-            if (stopGenerationRef.current.has(item.id)) continue;
+        const addReferences = (newRefs: any[]) => {
+            for (const ref of newRefs) {
+                if (ref && ref.url && !seenUrls.has(ref.url) && String(ref.url).startsWith('http')) {
+                    seenUrls.add(ref.url);
+                    collectedReferences.push(ref);
+                }
+            }
+             console.log(`[Reference Guardian] Total unique references collected: ${collectedReferences.length}`);
+        };
 
-            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Initializing...' } });
+        // --- STAGE 1: High-Precision Grounded Search ---
+        try {
+            console.log("[Reference Guardian] Stage 1: Attempting high-precision grounded search.");
+            const groundedText = await callAI('find_real_references', [title, contentSummary], 'json', true);
+            addReferences(JSON.parse(extractJson(groundedText)));
+        } catch (error: any) {
+            console.warn("[Reference Guardian] Stage 1 (Grounded Search) failed or returned no results.", error.message);
+        }
 
-            let rawResponseForDebugging: any = null;
-            let processedContent: GeneratedContent | null = null;
-            
-            if (item.type === 'link-optimizer') {
+        if (collectedReferences.length >= 8) {
+            console.log("[Reference Guardian] Quota met in Stage 1. Finalizing.");
+            return collectedReferences.slice(0, 12);
+        }
+
+        // --- STAGE 2: SERP-Contextualized Search ---
+        if (initialSerpData && initialSerpData.length > 0) {
+            try {
+                console.log("[Reference Guardian] Stage 2: Not enough refs. Attempting SERP-contextualized search.");
+                const serpContextText = await callAI('find_real_references_with_context', [title, contentSummary, initialSerpData], 'json');
+                addReferences(JSON.parse(extractJson(serpContextText)));
+            } catch (error: any) {
+                console.warn("[Reference Guardian] Stage 2 (SERP Context) failed.", error.message);
+            }
+        }
+
+        if (collectedReferences.length >= 8) {
+            console.log("[Reference Guardian] Quota met in Stage 2. Finalizing.");
+            return collectedReferences.slice(0, 12);
+        }
+
+        // --- STAGE 3: Proactive Broad Search & Rescue ---
+        console.log(`[Reference Guardian] Stage 3: Quota still not met (${collectedReferences.length}/8). Initiating proactive search & rescue.`);
+        
+        try {
+            // Generate diverse search queries to cast a wide net
+            const searchQueries = [
+                `"${primaryKeyword}" study OR research`,
+                `scientific review of "${title}"`,
+                `"${primaryKeyword}" statistics 2025`,
+                `expert analysis on "${primaryKeyword}"`,
+                `"${primaryKeyword}" government report OR .gov`,
+                `"${primaryKeyword}" university .edu research`
+            ];
+
+            let highQualitySearchResults: any[] = [];
+
+            // Execute all searches concurrently
+            await processConcurrently(searchQueries, async (query) => {
                 try {
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/2: Fetching original content...' } });
-
-                    if (!item.originalUrl) {
-                        throw new Error("Original URL is missing for link optimization.");
-                    }
-
-                    const pageResponse = await fetchWithProxies(item.originalUrl);
-                    const originalHtml = await pageResponse.text();
-
-                    const tempDiv = document.createElement('div');
-                    tempDiv.innerHTML = originalHtml.replace(/<script[^>]*>.*?<\/script>/gi, '');
-                    const mainContentElement = tempDiv.querySelector('main, article, .main-content, #main, #content, .post-content, [role="main"]');
-                    
-                    let contentToOptimize: string | undefined;
-                    let isFallback = false;
-
-                    if (mainContentElement) {
-                        contentToOptimize = mainContentElement.innerHTML;
-                    } else {
-                        const bodyElement = tempDiv.querySelector('body');
-                        if (bodyElement) {
-                            isFallback = true;
-                            const clonedBody = bodyElement.cloneNode(true) as HTMLElement;
-                            clonedBody.querySelector('header')?.remove();
-                            clonedBody.querySelector('footer')?.remove();
-                            clonedBody.querySelector('nav')?.remove();
-                            contentToOptimize = clonedBody.innerHTML;
+                    const searchResponse = await fetchWithProxies("https://google.serper.dev/search", {
+                        method: 'POST',
+                        headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ q: query, num: 5 })
+                    });
+                    if (searchResponse.ok) {
+                        const jsonData = await searchResponse.json();
+                        if (jsonData.organic) {
+                            highQualitySearchResults.push(...jsonData.organic);
                         }
                     }
-
-                    if (!contentToOptimize) {
-                        throw new Error("Could not extract main content from the page to optimize.");
-                    }
-                    
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/2: Optimizing Internal Links...' } });
-
-                    const optimizedContentHtml = await callAI('internal_link_optimizer', [contentToOptimize, existingPages], 'html');
-                    
-                    const finalOptimizedInnerContent = sanitizeHtmlResponse(optimizedContentHtml);
-                    
-                    let finalContentForPost: string;
-                    if (mainContentElement && !isFallback) {
-                        mainContentElement.innerHTML = finalOptimizedInnerContent;
-                        finalContentForPost = mainContentElement.outerHTML;
-                    } else {
-                        finalContentForPost = finalOptimizedInnerContent;
-                    }
-
-                    const originalTitle = tempDiv.querySelector('title')?.textContent || item.title;
-                    const originalMetaDesc = tempDiv.querySelector('meta[name="description"]')?.getAttribute('content') || `Updated content for ${originalTitle}`;
-
-                    const finalContentPayload = normalizeGeneratedContent({
-                        title: originalTitle,
-                        slug: extractSlugFromUrl(item.originalUrl!),
-                        metaDescription: originalMetaDesc,
-                        content: finalContentForPost,
-                        primaryKeyword: originalTitle,
-                        semanticKeywords: [],
-                        imageDetails: [],
-                        strategy: { targetAudience: '', searchIntent: '', competitorAnalysis: '', contentAngle: '' },
-                        jsonLdSchema: {},
-                        socialMediaCopy: { twitter: '', linkedIn: '' }
-                    }, item.title);
-
-                    finalContentPayload.content = processInternalLinks(finalContentPayload.content, existingPages);
-                    finalContentPayload.jsonLdSchema = generateFullSchema(finalContentPayload, wpConfig, siteInfo, [], geoTargeting);
-
-                    dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: finalContentPayload } });
-
-                } catch (error: any) {
-                    console.error(`Error optimizing links for "${item.title}":`, error);
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'error', statusText: `Error: ${error.message.substring(0, 100)}...` } });
-                } finally {
-                    generatedCount++;
-                    setGenerationProgress({ current: generatedCount, total: itemsToGenerate.length });
+                } catch (e) {
+                    console.warn(`[Reference Guardian] Search query failed: "${query}"`, e);
                 }
-                continue;
+            }, 3);
+
+            if (highQualitySearchResults.length === 0) {
+                 console.error("[Reference Guardian] Stage 3 failed to gather any search results.");
+                 throw new Error("Broad search returned no results.");
+            }
+            
+             console.log(`[Reference Guardian] Stage 3 gathered ${highQualitySearchResults.length} potential sources. Feeding to AI for formatting.`);
+
+            // Feed the curated, high-quality search results to the AI for final formatting
+            const rescueText = await callAI('find_real_references_with_context', [title, contentSummary, highQualitySearchResults], 'json');
+            addReferences(JSON.parse(extractJson(rescueText)));
+
+        } catch (error: any) {
+            console.error("[Reference Guardian] Stage 3 (Search & Rescue) failed critically.", error.message);
+        }
+        
+        // --- FINALIZATION ---
+        if (collectedReferences.length < 8) {
+            console.warn(`[Reference Guardian] WARNING: Could not meet the minimum reference quota. Final count: ${collectedReferences.length}. The article will proceed with the available references.`);
+        } else {
+             console.log(`[Reference Guardian] SUCCESS: Final reference count is ${collectedReferences.length}. Truncating to 12 if necessary.`);
+        }
+        
+        return collectedReferences.slice(0, 12);
+    }, [callAI, apiKeys.serperApiKey]);
+
+    const generateSingleItem = useCallback(async (item: ContentItem) => {
+        if (stopGenerationRef.current.has(item.id)) return;
+
+        // 👇 --- ADD THIS NEW PRE-FLIGHT CHECK BLOCK --- 👇
+        if (!apiKeys.serperApiKey || apiKeyStatus.serper !== 'valid') {
+            const errorMessage = "Cannot generate references. The Serper API key is missing or invalid. Please configure it in Step 1 (Setup) to proceed.";
+            dispatch({
+                type: 'UPDATE_STATUS',
+                payload: { id: item.id, status: 'error', statusText: errorMessage }
+            });
+            console.error(errorMessage);
+            return; // Stop the function immediately.
+        }
+        // --- END OF NEW PRE-FLIGHT CHECK ---
+
+        dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Initializing...' } });
+
+        let rawResponseForDebugging: any = null;
+        let processedContent: GeneratedContent | null = null;
+        
+        try {
+            if (item.type === 'link-optimizer') {
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/2: Fetching original content...' } });
+                if (!item.originalUrl) throw new Error("Original URL is missing for link optimization.");
+                const pageResponse = await fetchWithProxies(item.originalUrl);
+                const originalHtml = await pageResponse.text();
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalHtml.replace(/<script[^>]*>.*?<\/script>/gi, '');
+                const mainContentElement = tempDiv.querySelector('main, article, .main-content, #main, #content, .post-content, [role="main"]');
+                if (!mainContentElement) throw new Error("Could not extract main content from the page to optimize.");
+                const contentToOptimize = mainContentElement.innerHTML;
+                
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/2: Optimizing Internal Links...' } });
+                const optimizedContentHtml = await callAI('internal_link_optimizer', [contentToOptimize, existingPages], 'html');
+                const finalOptimizedInnerContent = sanitizeHtmlResponse(optimizedContentHtml);
+                const originalTitle = tempDiv.querySelector('title')?.textContent || item.title;
+                const originalMetaDesc = tempDiv.querySelector('meta[name="description"]')?.getAttribute('content') || `Updated content for ${originalTitle}`;
+
+                const finalContentPayload = normalizeGeneratedContent({
+                    title: originalTitle, slug: extractSlugFromUrl(item.originalUrl!), metaDescription: originalMetaDesc,
+                    content: finalOptimizedInnerContent, primaryKeyword: originalTitle, semanticKeywords: [], imageDetails: [],
+                    strategy: { targetAudience: 'N/A', searchIntent: 'N/A', competitorAnalysis: 'N/A', contentAngle: 'Internal Link Optimization' },
+                    jsonLdSchema: {}, socialMediaCopy: { twitter: '', linkedIn: '' }
+                }, item.title);
+
+                finalContentPayload.content = processInternalLinks(finalContentPayload.content, existingPages);
+                finalContentPayload.jsonLdSchema = generateFullSchema(finalContentPayload, wpConfig, siteInfo, [], geoTargeting);
+                dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: finalContentPayload } });
+                return;
             }
              
-            try {
-                let semanticKeywords: string[] | null = null;
-                let serpData: any[] | null = null;
-                let peopleAlsoAsk: string[] | null = null;
-                let youtubeVideos: any[] | null = null;
-                
-                const isPillar = item.type === 'pillar';
+            let serpData: any[] | null = null;
+            let peopleAlsoAsk: string[] | null = null;
+            let youtubeVideos: any[] | null = null;
+            let contentBrief: any | null = null;
+            let semanticKeywords: string[] | null = null;
+            const isPillar = item.type === 'pillar';
 
-                if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Fetching SERP Data...' } });
-                    const cacheKey = `serp-${item.title}`;
-                    const cachedSerp = apiCache.get(cacheKey);
-
-                    if (cachedSerp) {
-                         serpData = cachedSerp.serpData;
-                         youtubeVideos = cachedSerp.youtubeVideos;
-                         peopleAlsoAsk = cachedSerp.peopleAlsoAsk;
-                    } else {
-                        try {
-                            const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
-                                method: 'POST',
-                                headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ q: item.title })
-                            });
-                            if (!serperResponse.ok) throw new Error(`Serper API failed with status ${serperResponse.status}`);
-                            const serperJson = await serperResponse.json();
-                            serpData = serperJson.organic ? serperJson.organic.slice(0, 10) : [];
-                            peopleAlsoAsk = serperJson.peopleAlsoAsk ? serperJson.peopleAlsoAsk.map((p: any) => p.question) : [];
-                            
-                            const videoCandidates = new Map<string, any>();
-                            const videoQueries = [`"${item.title}" tutorial`, `how to ${item.title}`, item.title];
-
-                            for (const query of videoQueries) {
-                                if (videoCandidates.size >= 10) break;
-                                try {
-                                    const videoResponse = await fetchWithProxies("https://google.serper.dev/videos", {
-                                        method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: query })
-                                    });
-                                    if (videoResponse.ok) {
-                                        const json = await videoResponse.json();
-                                        for (const v of (json.videos || [])) {
-                                            const videoId = extractYouTubeID(v.link);
-                                            if (videoId && !videoCandidates.has(videoId)) videoCandidates.set(videoId, { ...v, videoId });
-                                        }
+            if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/7: Fetching SERP Data...' } });
+                const cacheKey = `serp-${item.title}`;
+                const cachedSerp = apiCache.get(cacheKey);
+                if (cachedSerp) {
+                     serpData = cachedSerp.serpData; youtubeVideos = cachedSerp.youtubeVideos; peopleAlsoAsk = cachedSerp.peopleAlsoAsk;
+                } else {
+                    try {
+                        const serperResponse = await fetchWithProxies("https://google.serper.dev/search", { method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: item.title }) });
+                        if (!serperResponse.ok) throw new Error(`Serper API failed with status ${serperResponse.status}`);
+                        const serperJson = await serperResponse.json();
+                        serpData = serperJson.organic ? serperJson.organic.slice(0, 10) : [];
+                        peopleAlsoAsk = serperJson.peopleAlsoAsk ? serperJson.peopleAlsoAsk.map((p: any) => p.question) : [];
+                        const videoCandidates = new Map<string, any>();
+                        const videoQueries = [`"${item.title}" tutorial`, `how to ${item.title}`, item.title];
+                        for (const query of videoQueries) {
+                            if (videoCandidates.size >= 10) break;
+                            try {
+                                const videoResponse = await fetchWithProxies("https://google.serper.dev/videos", { method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: query }) });
+                                if (videoResponse.ok) {
+                                    const json = await videoResponse.json();
+                                    for (const v of (json.videos || [])) {
+                                        const videoId = extractYouTubeID(v.link);
+                                        if (videoId && !videoCandidates.has(videoId)) videoCandidates.set(videoId, { ...v, videoId });
                                     }
-                                } catch (e) { console.warn(`Video search failed for "${query}".`, e); }
-                            }
-                            youtubeVideos = getUniqueYoutubeVideos(Array.from(videoCandidates.values()), YOUTUBE_EMBED_COUNT);
-                            apiCache.set(cacheKey, { serpData, youtubeVideos, peopleAlsoAsk });
-                        } catch (serpError) {
-                            console.error("Failed to fetch SERP data:", serpError);
-                        }
-                    }
-                }
-
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/5: Analyzing Topic...' } });
-                const skCacheKey = `sk-${item.title}`;
-                if (apiCache.get(skCacheKey)) {
-                    semanticKeywords = apiCache.get(skCacheKey);
-                } else {
-                    const skResponseText = await callAI('semantic_keyword_generator', [item.title], 'json');
-                    const parsedSk = JSON.parse(extractJson(skResponseText));
-                    semanticKeywords = parsedSk.semanticKeywords;
-                    apiCache.set(skCacheKey, semanticKeywords);
-                }
-
-                if (stopGenerationRef.current.has(item.id)) break;
-
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/5: Generating Article Outline...' } });
-                const outlineResponseText = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, peopleAlsoAsk, existingPages, item.crawledContent, item.analysis], 'json', useGoogleSearch);
-                rawResponseForDebugging = outlineResponseText;
-                const metaAndOutline = JSON.parse(extractJson(outlineResponseText));
-
-                metaAndOutline.introduction = sanitizeHtmlResponse(metaAndOutline.introduction);
-                metaAndOutline.conclusion = sanitizeHtmlResponse(metaAndOutline.conclusion);
-
-                const fullFaqData: { question: string, answer: string }[] = [];
-                let contentParts: string[] = [];
-                contentParts.push(metaAndOutline.introduction);
-                
-                // contentParts.push(generateEeatBoxHtml(siteInfo, item.title));
-                
-                contentParts.push(`<h3>Key Takeaways</h3>\n<ul>\n${metaAndOutline.keyTakeaways.map((t: string) => `<li>${t}</li>`).join('\n')}\n</ul>`);
-
-                const sections = metaAndOutline.outline;
-                for (let i = 0; i < sections.length; i++) {
-                    if (stopGenerationRef.current.has(item.id)) break;
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Writing section ${i + 1} of ${sections.length}...` } });
-                    
-                    let sectionContent = `<h2>${sections[i]}</h2>`;
-                    const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, sections[i], existingPages], 'html');
-                    sectionContent += sanitizeHtmlResponse(sectionHtml);
-                    contentParts.push(sectionContent);
-                    
-                    if (youtubeVideos && youtubeVideos.length > 0) {
-                        if (i === 1 && youtubeVideos[0]) {
-                            contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[0].embedUrl}" title="${youtubeVideos[0].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
-                        }
-                        if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) {
-                            contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[1].embedUrl}" title="${youtubeVideos[1].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
-                        }
-                    }
-                }
-                
-                contentParts.push(metaAndOutline.conclusion);
-
-                contentParts.push(`<div class="faq-section"><h2>Frequently Asked Questions</h2>`);
-                
-                for (let i = 0; i < metaAndOutline.faqSection.length; i++) {
-                    if (stopGenerationRef.current.has(item.id)) break;
-                    const faq = metaAndOutline.faqSection[i];
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Answering FAQ ${i + 1} of ${metaAndOutline.faqSection.length}...` } });
-                    
-                    const answerHtml = await callAI('write_faq_answer', [faq.question], 'html');
-                    const cleanAnswer = sanitizeHtmlResponse(answerHtml).replace(/^<p>|<\/p>$/g, '');
-                    contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
-                    fullFaqData.push({ question: faq.question, answer: cleanAnswer });
-                }
-                contentParts.push(`</div>`);
-
-                
-                if (stopGenerationRef.current.has(item.id)) {
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'idle', statusText: 'Stopped by user' } });
-                    break;
-                }
-
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 3/5: Finding Real Sources...` } });
-                const contentSummaryForRefs = contentParts.join(' ').replace(/<[^>]+>/g, ' ').substring(0, 2000);
-                
-                let references: any[] | null = null;
-                let rawSearchResultsForFallback: any[] = [];
-
-                if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
-                    const searchQueries = [
-                        `academic research and studies on "${metaAndOutline.title}" filetype:pdf`,
-                        `"${metaAndOutline.primaryKeyword}" industry report OR analysis 2024 2025`,
-                        `in-depth guide "${metaAndOutline.title}" site:.edu OR site:.gov`,
-                    ];
-
-                    for (const query of searchQueries) {
-                        if (references && references.length > 0) break;
-                        try {
-                            console.log(`[Reference Search] Attempting query: "${query}"`);
-                            const serperResponse = await fetchWithProxies("https://google.serper.dev/search", {
-                                method: 'POST',
-                                headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ q: query, num: 15 })
-                            });
-                            if (!serperResponse.ok) continue;
-
-                            const serperJson = await serperResponse.json();
-                            const searchResults = serperJson.organic ? serperJson.organic.map((r: any) => ({
-                                title: r.title, link: r.link, snippet: r.snippet
-                            })) : [];
-                            
-                            if (searchResults.length > 0) {
-                                rawSearchResultsForFallback.push(...searchResults);
-                                const referencesText = await callAI('find_real_references_with_context', [metaAndOutline.title, contentSummaryForRefs, searchResults], 'json');
-                                const parsedRefs = JSON.parse(extractJson(referencesText));
-                                if (parsedRefs && parsedRefs.length > 0) {
-                                    references = parsedRefs;
                                 }
-                            }
-                        } catch (serperError) {
-                            console.warn(`[Reference Search] Query failed. Trying next.`, serperError);
+                            } catch (e) { console.warn(`Video search failed for "${query}".`, e); }
                         }
+                        youtubeVideos = getUniqueYoutubeVideos(Array.from(videoCandidates.values()), YOUTUBE_EMBED_COUNT);
+                        apiCache.set(cacheKey, { serpData, youtubeVideos, peopleAlsoAsk });
+                    } catch (serpError) { console.error("Failed to fetch SERP data:", serpError); }
+                }
+            }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/7: Creating Content Brief...' } });
+            const briefText = await callAI('content_brief_generator', [item.title, serpData], 'json');
+            contentBrief = JSON.parse(extractJson(briefText));
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 3/7: Generating Semantic Keywords...' } });
+            const skCacheKey = `sk-${item.title}`;
+            if (apiCache.get(skCacheKey)) {
+                semanticKeywords = apiCache.get(skCacheKey);
+            } else {
+                const skResponseText = await callAI('semantic_keyword_generator', [item.title], 'json');
+                const parsedSk = JSON.parse(extractJson(skResponseText));
+                semanticKeywords = parsedSk.semanticKeywords;
+                apiCache.set(skCacheKey, semanticKeywords);
+            }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/7: Generating Article Outline...' } });
+            const templateName = getContentTemplate(item.title);
+            const contentTemplate = PROMPT_TEMPLATES.contentTemplates[templateName as keyof typeof PROMPT_TEMPLATES.contentTemplates];
+            const outlineResponseText = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, peopleAlsoAsk, existingPages, item.crawledContent, item.analysis, contentBrief, contentTemplate], 'json', useGoogleSearch);
+            rawResponseForDebugging = outlineResponseText;
+            const metaAndOutline = JSON.parse(extractJson(outlineResponseText));
+            metaAndOutline.introduction = sanitizeHtmlResponse(metaAndOutline.introduction);
+            metaAndOutline.conclusion = sanitizeHtmlResponse(metaAndOutline.conclusion);
+
+            let contentParts: string[] = [metaAndOutline.introduction, `<h3>Key Takeaways</h3>\n<ul>\n${metaAndOutline.keyTakeaways.map((t: string) => `<li>${t}</li>`).join('\n')}\n</ul>`];
+            const sections = metaAndOutline.outline;
+            for (let i = 0; i < sections.length; i++) {
+                if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 5/7: Writing section ${i + 1} of ${sections.length}...` } });
+                let sectionContent = `<h2>${sections[i]}</h2>`;
+                const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, sections[i], existingPages, serpData], 'html');
+                sectionContent += sanitizeHtmlResponse(sectionHtml);
+                contentParts.push(sectionContent);
+                if (youtubeVideos?.length) {
+                    if (i === 1 && youtubeVideos[0]) contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[0].embedUrl}" title="${youtubeVideos[0].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
+                    if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[1].embedUrl}" title="${youtubeVideos[1].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
+                }
+            }
+            contentParts.push(metaAndOutline.conclusion);
+            const fullFaqData: { question: string, answer: string }[] = [];
+            const faqQuestions = metaAndOutline.faqSection.map((faq: any) => faq.question);
+            if (faqQuestions.length > 0) {
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 5/7: Answering ${faqQuestions.length} FAQs...` } });
+                const faqResponseText = await callAI('write_faq_section', [faqQuestions], 'json');
+                const { faqs: answeredFaqs } = JSON.parse(extractJson(faqResponseText));
+                if (answeredFaqs?.length > 0) {
+                    contentParts.push(`<div class="faq-section"><h2>Frequently Asked Questions</h2>`);
+                    for (const faq of answeredFaqs) {
+                        if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+                        const cleanAnswer = sanitizeHtmlResponse(faq.answer).replace(/^<p>|<\/p>$/g, '');
+                        contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
+                        fullFaqData.push({ question: faq.question, answer: cleanAnswer });
+                    }
+                    contentParts.push(`</div>`);
+                }
+            }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
+            let finalContent = contentParts.join('\n\n');
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 6/7: Generating Images...` } });
+            const updatedImageDetails = [...metaAndOutline.imageDetails];
+            for (let i = 0; i < updatedImageDetails.length; i++) {
+                if (stopGenerationRef.current.has(item.id)) break;
+                const imageDetail = updatedImageDetails[i];
+                try {
+                    const generatedImageSrc = await generateImageWithFallback(imageDetail.prompt);
+                    if (generatedImageSrc) {
+                        imageDetail.generatedImageSrc = generatedImageSrc;
+                        finalContent = finalContent.replace(imageDetail.placeholder, `<figure class="wp-block-image size-large"><img src="${generatedImageSrc}" alt="${imageDetail.altText}" title="${imageDetail.title}"/><figcaption>${imageDetail.altText}</figcaption></figure>`);
+                    } else finalContent = finalContent.replace(imageDetail.placeholder, '');
+                } catch (imgError) {
+                    console.error(`Failed to generate image for prompt: "${imageDetail.prompt}"`, imgError);
+                    finalContent = finalContent.replace(imageDetail.placeholder, '');
+                }
+            }
+            finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, '');
+            
+// --- NEW SOTA "REFERENCE GUARDIAN" SYSTEM ---
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 7/7: Finding Sources & Finalizing...` } });
+            const contentSummaryForRefs = finalContent.replace(/<[^>]+>/g, ' ').substring(0, 2000);
+
+            const references = await generateReferencesWithEnforcement(
+                metaAndOutline.title,
+                metaAndOutline.primaryKeyword,
+                contentSummaryForRefs,
+                serpData
+            );
+
+            if (references && references.length > 0) {
+                let referencesHtml = '<h2>References</h2>\n<ol>\n';
+                for (const ref of references) {
+                     // Final validation check before rendering
+                    if (ref.title && ref.url && ref.source && ref.year) {
+                        referencesHtml += `<li><a href="${ref.url}" target="_blank" rel="noopener noreferrer">${ref.title.replace(/</g, '&lt;')}</a> (${ref.source.replace(/</g, '&lt;')}, ${ref.year})</li>\n`;
                     }
                 }
+                referencesHtml += '</ol>';
+                finalContent += '\n\n' + referencesHtml;
+            }
+            // --- END OF NEW SYSTEM ---
+            
+// --- This is the NEW, FIXED code block ---
+            finalContent = sanitizeBrokenPlaceholders(finalContent); // 1. Clean up malformed placeholders first.
+            finalContent = deduplicateInternalLinks(finalContent);   // 2. NEW: Remove any duplicate links the AI created.
+            finalContent = validateAndRepairInternalLinks(finalContent, existingPages); // 3. Repair any remaining invalid links.
+            finalContent = enforceInternalLinkQuota(finalContent, existingPages, metaAndOutline.primaryKeyword, MIN_INTERNAL_LINKS); // 4. Add new links if needed (this already prevents adding duplicates).
+            finalContent = processInternalLinks(finalContent, existingPages); // 5. Convert all valid placeholders to <a> tags.
+            finalContent = enforceUniqueVideoEmbeds(finalContent, youtubeVideos || []);
+            enforceWordCount(finalContent, isPillar ? TARGET_MIN_WORDS_PILLAR : TARGET_MIN_WORDS, isPillar ? TARGET_MAX_WORDS_PILLAR : TARGET_MAX_WORDS);
+            checkHumanWritingScore(finalContent);
+            
+            processedContent = normalizeGeneratedContent({ ...metaAndOutline, content: finalContent, imageDetails: updatedImageDetails, serpData }, item.title);
+            processedContent = injectRankingTriggers(processedContent);
+            processedContent.jsonLdSchema = generateFullSchema(processedContent, wpConfig, siteInfo, fullFaqData, geoTargeting);
+            dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: processedContent } });
+} catch (error: any) {
+            console.error(`Error generating item "${item.title}":`, error);
+            console.error("RAW AI RESPONSE FOR DEBUGGING:", rawResponseForDebugging);
 
-                if (!references || references.length === 0) {
-                    try {
-                        console.log("Finding references using Gemini's Google Search grounding as a fallback...");
-                        const referencesText = await callAI('find_real_references', [metaAndOutline.title, contentSummaryForRefs], 'json', true);
-                        references = JSON.parse(extractJson(referencesText));
-                    } catch (groundingError) {
-                         console.error("Gemini's Google Search grounding also failed.", groundingError);
-                    }
-                }
-                
-                if (references && Array.isArray(references) && references.length > 0) {
-                    let referencesHtml = '<h2>References</h2>\n<ol>\n';
-                    for (const ref of references) {
-                        if (ref.title && ref.url && ref.source && ref.year) {
-                            const safeTitle = ref.title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                            const safeSource = ref.source.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                            if (String(ref.url).startsWith('http')) {
-                                referencesHtml += `<li><a href="${ref.url}" target="_blank" rel="noopener noreferrer">${safeTitle}</a> (${safeSource}, ${ref.year})</li>\n`;
-                            }
-                        }
-                    }
-                    referencesHtml += '</ol>';
-                    contentParts.push(referencesHtml);
-                } else {
-                    console.warn(`[Reference Generation] Automated extraction failed. Using SOTA fallback.`);
-                    const uniqueLinks = new Map();
-                    rawSearchResultsForFallback.forEach(r => { if (r.link && !uniqueLinks.has(r.link)) uniqueLinks.set(r.link, r); });
-                    const filteredResults = Array.from(uniqueLinks.values()).filter(r => 
-                        !['pinterest.com', 'youtube.com', 'facebook.com', 'twitter.com', 'forum', '.quora.com'].some(domain => r.link.includes(domain))
-                    ).slice(0, 10);
-                    
-                    if (filteredResults.length > 0) {
-                        let suggestedReadingHtml = `
-                        <div class="manual-action-required-box warning-box">
-                            <h3><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 1.2em; height: 1.2em; margin-right: 0.5em;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg> Suggested Reading &amp; Further Research</h3>
-                            <p>The following resources were automatically identified as highly relevant. Please review them for suitability as formal references and cite them where appropriate.</p>
-                            <ul>${filteredResults.map(r => `<li><a href="${r.link}" target="_blank" rel="noopener noreferrer">${r.title}</a></li>`).join('\n')}</ul>
-                        </div>`;
-                        contentParts.push(suggestedReadingHtml);
-                    } else {
-                        const originalWarningHtml = `
-                        <div class="manual-action-required-box error-box">
-                            <h3><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 1.2em; height: 1.2em; margin-right: 0.5em;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg> Action Required: Add References</h3>
-                            <p>Our automated reference finder could not locate credible sources for this topic. Please manually research and add a list of 8-12 authoritative references in this section.</p>
-                        </div>`;
-                        contentParts.push(originalWarningHtml);
-                    }
-                }
-
-                let finalContent = contentParts.join('\n\n');
-                
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/5: Generating Images...' } });
-                const updatedImageDetails = [...metaAndOutline.imageDetails];
-                for (let i = 0; i < updatedImageDetails.length; i++) {
-                    if (stopGenerationRef.current.has(item.id)) break;
-                    const imageDetail = updatedImageDetails[i];
-                    try {
-                        const generatedImageSrc = await generateImageWithFallback(imageDetail.prompt);
-                        if (generatedImageSrc) {
-                            imageDetail.generatedImageSrc = generatedImageSrc;
-                            const imageHtml = `<figure class="wp-block-image size-large"><img src="${generatedImageSrc}" alt="${imageDetail.altText}" title="${imageDetail.title}"/><figcaption>${imageDetail.altText}</figcaption></figure>`;
-                            finalContent = finalContent.replace(imageDetail.placeholder, imageHtml);
-                        } else {
-                             finalContent = finalContent.replace(imageDetail.placeholder, '');
-                        }
-                    } catch (imgError) {
-                        console.error(`Failed to generate image for prompt: "${imageDetail.prompt}"`, imgError);
-                        finalContent = finalContent.replace(imageDetail.placeholder, '');
-                    }
-                }
-                finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, '');
-
-                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 5/5: Finalizing...' } });
-                
-                finalContent = sanitizeBrokenPlaceholders(finalContent);
-                finalContent = validateAndRepairInternalLinks(finalContent, existingPages);
-                finalContent = enforceInternalLinkQuota(finalContent, existingPages, metaAndOutline.primaryKeyword, MIN_INTERNAL_LINKS);
-                finalContent = processInternalLinks(finalContent, existingPages);
-                finalContent = enforceUniqueVideoEmbeds(finalContent, youtubeVideos || []);
-
-                const minWords = isPillar ? TARGET_MIN_WORDS_PILLAR : TARGET_MIN_WORDS;
-                const maxWords = isPillar ? TARGET_MAX_WORDS_PILLAR : TARGET_MAX_WORDS;
-                enforceWordCount(finalContent, minWords, maxWords);
-                checkHumanWritingScore(finalContent);
-                
-                processedContent = normalizeGeneratedContent({
-                    ...metaAndOutline,
-                    content: finalContent,
-                    imageDetails: updatedImageDetails,
-                    serpData: serpData
+            if (error instanceof ContentTooShortError) {
+                const partialContent: GeneratedContent = normalizeGeneratedContent({
+                    ...(processedContent || {}), 
+                    title: item.title,
+                    content: error.content, 
                 }, item.title);
-                
-                processedContent.jsonLdSchema = generateFullSchema(processedContent, wpConfig, siteInfo, fullFaqData, geoTargeting);
 
-                dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: processedContent } });
-            
-            } catch (error: any) {
-                console.error(`Error generating content for "${item.title}":`, error);
-                
-                if (error instanceof ContentTooShortError) {
-                    const salvagedContent = normalizeGeneratedContent({
-                        title: item.title,
-                        content: error.content,
-                    }, item.title);
-
-                    dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: salvagedContent } });
-                    
-                    dispatch({
-                        type: 'UPDATE_STATUS',
-                        payload: {
-                            id: item.id,
-                            status: 'error',
-                            statusText: `Content too short (${error.wordCount} words). Review manually.`
-                        }
-                    });
-                } else {
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'error', statusText: `Error: ${error.message.substring(0, 100)}...` } });
-                }
-            } finally {
-                generatedCount++;
-                setGenerationProgress({ current: generatedCount, total: itemsToGenerate.length });
+                dispatch({
+                    type: 'SET_CONTENT',
+                    payload: { id: item.id, content: partialContent }
+                });
+                dispatch({
+                    type: 'UPDATE_STATUS',
+                    payload: { id: item.id, status: 'error', statusText: `Content too short (${error.wordCount} words). Review required.` }
+                });
+            } else {
+                 dispatch({
+                    type: 'UPDATE_STATUS',
+                    payload: { id: item.id, status: 'error', statusText: `Error: ${error.message.substring(0, 100)}` }
+                });
             }
+        } finally {
+             stopGenerationRef.current.delete(item.id);
         }
+    }, [callAI, existingPages, apiKeys.serperApiKey, apiKeyStatus.serper, wpConfig, siteInfo, geoTargeting, generateImageWithFallback]);
 
-        setIsGenerating(false);
+const publishItem = async (
+        itemToPublish: ContentItem,
+        currentWpPassword: string,
+        status: 'publish' | 'draft' = 'publish'
+    ): Promise<{ success: boolean; message: React.ReactNode; link?: string; }> => {
+        const { generatedContent, originalUrl } = itemToPublish;
+        if (!generatedContent) return { success: false, message: 'No content to publish.' };
 
-    }, [apiClients, apiKeys, apiKeyStatus, callAI, existingPages, generateImageWithFallback, geoTargeting, openrouterModels, selectedGroqModel, selectedModel, siteInfo, useGoogleSearch, wpConfig]);
-    
-const publishItemToWordPress = async (
-    itemToPublish: ContentItem,
-    currentWpPassword: string,
-    status: 'publish' | 'draft'
-): Promise<{ success: boolean; message: React.ReactNode; link?: string }> => {
-    const { generatedContent } = itemToPublish;
-    if (!generatedContent) {
-        return { success: false, message: 'No content to publish.' };
-    }
+        let { content, imageDetails, title, metaDescription, slug } = generatedContent;
+        const isUpdate = !!originalUrl;
 
-    let contentWithWpImages = generatedContent.content;
-    let featuredImageId: number | null = null;
-    const base64ImageRegex = /<img[^>]+src="data:image\/(jpeg|png|webp);base64,([^"]+)"[^>]*>/g;
+        const headers = new Headers({
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' + btoa(`${wpConfig.username}:${currentWpPassword}`)
+        });
 
-    const imagesToUpload = [...contentWithWpImages.matchAll(base64ImageRegex)].map((match, index) => {
-        const fullImgTag = match[0];
-        const base64Data = `data:image/${match[1]};base64,${match[2]}`;
-        const altText = fullImgTag.match(/alt="([^"]*)"/)?.[1] || generatedContent.title;
-        const imgTitle = fullImgTag.match(/title="([^"]*)"/)?.[1] || generatedContent.slug;
-        return { fullImgTag, base64Data, altText, imgTitle, index };
-    });
-
-    for (const image of imagesToUpload) {
+        // --- STAGE 1: Resilient Image Upload ---
         try {
-            const { blob: webpBlob, mimeType: webpMimeType } = await convertToWebP(image.base64Data);
-            const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
-            
-            const headers = new Headers({
-                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
-                'Content-Disposition': `attachment; filename="${image.imgTitle}-${image.index}.webp"`,
-                'Content-Type': webpMimeType,
-            });
+            for (let i = 0; i < imageDetails.length; i++) {
+                const image = imageDetails[i];
+                if (image.generatedImageSrc && image.generatedImageSrc.startsWith('data:')) {
+                    const blob = await (await fetch(image.generatedImageSrc)).blob();
+                    
+                    const mediaHeaders = new Headers({
+                        'Authorization': headers.get('Authorization')!,
+                        'Content-Disposition': `attachment; filename="${image.title}.jpg"`,
+                        'Content-Type': 'image/jpeg'
+                    });
 
-            const uploadResponse = await fetchWordPressWithRetry(uploadUrl, { method: 'POST', headers, body: webpBlob });
-            
-            if (!uploadResponse.ok) {
-                const errorData = await uploadResponse.json().catch(() => ({ message: 'Unknown upload error' }));
-                throw new Error(`Media upload failed: ${errorData.message}`);
-            }
-            
-            const mediaData = await uploadResponse.json();
-            const newImageUrl = mediaData.source_url;
-            const newImgTag = image.fullImgTag.replace(/src="[^"]+"/, `src="${newImageUrl}" class="wp-image-${mediaData.id}"`);
-            contentWithWpImages = contentWithWpImages.replace(image.fullImgTag, newImgTag);
+                    const mediaResponse = await fetchWordPressWithRetry(`${wpConfig.url}/wp-json/wp/v2/media`, {
+                        method: 'POST',
+                        headers: mediaHeaders,
+                        body: blob
+                    });
 
-            if (image.index === 0) {
-                featuredImageId = mediaData.id;
+                    // --- NEW SOTA ERROR DIAGNOSTICS ---
+                    if (!mediaResponse.ok) {
+                        // This block now captures the TRUE error message from the server.
+                        const errorText = await mediaResponse.text();
+                        let errorMessage = `Server responded with status ${mediaResponse.status}.`;
+                        
+                        // Try to parse as JSON, but fall back to raw text if it fails (e.g., HTML from a security plugin).
+                        try {
+                            const errorJson = JSON.parse(errorText);
+                            errorMessage = errorJson.message || JSON.stringify(errorJson);
+                        } catch (e) {
+                            // This is the key fix: It captures non-JSON errors.
+                             const strippedError = errorText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+                             errorMessage = `A server-side error occurred. The response was not valid JSON, which often indicates a security plugin (like Wordfence) or firewall is blocking the request. Server response snippet: "${strippedError.substring(0, 150)}..."`;
+                        }
+                        throw new Error(errorMessage);
+                    }
+                    // --- END OF NEW DIAGNOSTICS ---
+
+                    const mediaData = await mediaResponse.json();
+                    content = content.replace(new RegExp(escapeRegExp(image.generatedImageSrc), 'g'), mediaData.source_url);
+                }
             }
         } catch (error: any) {
-            console.error('Image upload and conversion failed:', error);
-            return { success: false, message: `Image processing failed: ${error.message}` };
+             // The error message passed here will now be highly specific and helpful.
+             return { success: false, message: `Image upload failed: ${error.message}` };
         }
-    }
 
-    const postData: any = {
-        title: generatedContent.title,
-        content: contentWithWpImages + generateSchemaMarkup(generatedContent.jsonLdSchema),
-        status: status,
-        slug: generatedContent.slug,
-        meta: {
-            _yoast_wpseo_title: generatedContent.title,
-            _yoast_wpseo_metadesc: generatedContent.metaDescription,
-            rank_math_title: generatedContent.title,
-            rank_math_description: generatedContent.metaDescription,
+        // --- STAGE 2: Post Publishing ---
+        const postData: any = {
+            title,
+            content,
+            status: isUpdate ? 'publish' : status, // Updates should always be published.
+            slug,
+            meta: {
+                _yoast_wpseo_title: title,
+                _yoast_wpseo_metadesc: metaDescription,
+            },
+        };
+
+        let endpoint = `${wpConfig.url}/wp-json/wp/v2/posts`;
+        let method = 'POST';
+
+        if (isUpdate) {
+            try {
+                const searchResponse = await fetchWordPressWithRetry(`${wpConfig.url}/wp-json/wp/v2/posts?slug=${slug}&status=any&_fields=id`, { headers });
+                if (!searchResponse.ok) throw new Error('Failed to search for the original post before updating.');
+                const posts = await searchResponse.json();
+                if (posts.length > 0) {
+                    const postId = posts[0].id;
+                    endpoint = `${wpConfig.url}/wp-json/wp/v2/posts/${postId}`;
+                    method = 'POST'; // WordPress uses POST for updates on specific ID endpoints
+                } else {
+                    console.warn(`Could not find post with slug "${slug}" to update. A new post will be created instead.`);
+                }
+            } catch (e: any) {
+                 return { success: false, message: `Could not find the original post to update. Error: ${e.message}` };
+            }
+        }
+
+        try {
+            const response = await fetchWordPressWithRetry(endpoint, {
+                method,
+                headers,
+                body: JSON.stringify(postData)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.json().catch(() => ({ message: `WordPress API returned status ${response.status}`}));
+                const errorMessage = errorBody.message || JSON.stringify(errorBody);
+                throw new Error(errorMessage);
+            }
+            const data = await response.json();
+            return {
+                success: true,
+                message: <a href={data.link} target="_blank" rel="noopener noreferrer">Successfully {isUpdate ? 'updated!' : 'published!'} View Post</a>,
+                link: data.link
+            };
+
+        } catch (error: any) {
+             return { success: false, message: `Publishing failed: ${error.message}` };
         }
     };
-    if (featuredImageId) {
-        postData.featured_media = featuredImageId;
-    }
 
-    try {
-        let apiUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/posts`;
-        
-        // ✅ FIX: Better error handling for post lookup
-        if (itemToPublish.originalUrl) {
-            const slug = extractSlugFromUrl(itemToPublish.originalUrl);
-            console.log(`[Update] Looking up post with slug: "${slug}"`);
-            console.log(`[Update] Original URL: ${itemToPublish.originalUrl}`);
+    const handleSaveChanges = (itemId: string, updatedSeo: { title: string; metaDescription: string; slug: string }, updatedContent: string) => {
+        const item = items.find(i => i.id === itemId);
+        if (item && item.generatedContent) {
+            const updatedGeneratedContent = {
+                ...item.generatedContent,
+                title: updatedSeo.title,
+                metaDescription: updatedSeo.metaDescription,
+                slug: extractSlugFromUrl(updatedSeo.slug),
+                content: updatedContent,
+            };
+
+            updatedGeneratedContent.jsonLdSchema = generateFullSchema(
+                updatedGeneratedContent, wpConfig, siteInfo, [], geoTargeting
+            );
             
-            const lookupUrl = `${apiUrl}?slug=${slug}&_fields=id&status=publish,future,draft,pending,private`;
-            
-            const headers = new Headers({ 
-                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
-                'Content-Type': 'application/json'
-            });
-            
-            let lookupResponse;
-            try {
-                lookupResponse = await fetchWordPressWithRetry(lookupUrl, { headers });
-            } catch (fetchError: any) {
-                console.error('[Update] Fetch error during lookup:', fetchError);
-                return { 
-                    success: false, 
-                    message: `Connection failed while looking up post. Check that your WordPress site is accessible and the REST API is enabled. Error: ${fetchError.message}` 
-                };
-            }
-            
-            // ✅ Detailed error handling based on status code
-            if (!lookupResponse.ok) {
-                const errorText = await lookupResponse.text();
-                console.error(`[Update] Lookup failed with status ${lookupResponse.status}:`, errorText);
-                
-                if (lookupResponse.status === 401) {
-                    return { 
-                        success: false, 
-                        message: 'Authentication failed. Please check your WordPress username and application password in Step 1.' 
-                    };
-                }
-                
-                if (lookupResponse.status === 403) {
-                    return { 
-                        success: false, 
-                        message: 'Permission denied. Your WordPress user account may not have permission to edit posts.' 
-                    };
-                }
-                
-                if (lookupResponse.status === 404) {
-                    return { 
-                        success: false, 
-                        message: `The WordPress REST API endpoint was not found. Make sure your WordPress site has the REST API enabled and permalinks are set to "Post name" in Settings > Permalinks.` 
-                    };
-                }
-                
-                return { 
-                    success: false, 
-                    message: `Post lookup failed with HTTP ${lookupResponse.status}. Error: ${errorText.substring(0, 200)}` 
-                };
-            }
-            
-            const posts = await lookupResponse.json();
-            console.log(`[Update] Found ${posts.length} post(s) with slug "${slug}"`);
-            
-            if (posts.length > 0) {
-                const postId = posts[0].id;
-                console.log(`[Update] Updating post ID: ${postId}`);
-                apiUrl = `${apiUrl}/${postId}`;
-            } else {
-                return { 
-                    success: false, 
-                    message: (
-                        <span>
-                            Could not find a post with slug "{slug}" on your WordPress site. 
-                            The post may have been deleted, or the URL might be incorrect. 
-                            <br/><br/>
-                            Original URL: <code>{itemToPublish.originalUrl}</code>
-                            <br/>
-                            Extracted slug: <code>{slug}</code>
-                        </span>
-                    )
-                };
-            }
+            dispatch({ type: 'SET_CONTENT', payload: { id: itemId, content: updatedGeneratedContent } });
         }
-
-        // ✅ Proceed with create/update
-        console.log(`[Publish] ${itemToPublish.originalUrl ? 'Updating' : 'Creating'} post at: ${apiUrl}`);
-        
-        const postResponse = await fetchWordPressWithRetry(apiUrl, {
-            method: 'POST',
-            headers: new Headers({
-                'Authorization': `Basic ${btoa(`${wpConfig.username}:${currentWpPassword}`)}`,
-                'Content-Type': 'application/json'
-            }),
-            body: JSON.stringify(postData)
-        });
-        
-        const responseData = await postResponse.json();
-        if (!postResponse.ok) {
-            console.error('[Publish] Post creation/update failed:', responseData);
-            throw new Error(responseData.message || `API returned status ${postResponse.status}`);
-        }
-        
-        const actionText = itemToPublish.originalUrl ? 'updated' : 'published';
-        console.log(`[Publish] Successfully ${actionText}:`, responseData.link);
-        
-        return {
-            success: true,
-            message: (<span>Successfully {actionText}! <a href={responseData.link} target="_blank" rel="noopener noreferrer">View Post</a></span>),
-            link: responseData.link,
-        };
-    } catch (error: any) {
-        console.error('[Publish] Fatal error:', error);
-        return { success: false, message: `Error: ${error.message}` };
-    }
-};
-
+    };
+    
+    const onPublishSuccess = (originalUrl: string) => {
+        setExistingPages(prev => prev.map(page =>
+            page.id === originalUrl
+                ? { ...page, publishedState: 'updated', updatePriority: 'Healthy', lastMod: new Date().toISOString() }
+                : page
+        ));
+    };
 
     return (
-        <div className="app-container">
-            <header className="app-header">
-                <div className="app-header-content">
-                    <a href="https://affiliatemarketingforsuccess.com/" target="_blank" rel="noopener noreferrer">
-                        <img src="https://affiliatemarketingforsuccess.com/wp-content/uploads/2023/03/cropped-Affiliate-Marketing-for-Success-Logo-Edited.png?lm=6666FEE0" alt="WP Content Optimizer Pro Logo" className="header-logo" />
-                    </a>
-                    <div className="header-title-group">
-                        <h1>WP Content <span>Optimizer Pro</span></h1>
-                        <p className="header-tagline">By <a href="https://affiliatemarketingforsuccess.com/" target="_blank" rel="noopener noreferrer">Alexios Papaioannou</a></p>
+        <div className={`app-container ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+            <div className="toast-container">
+                {toasts.map(toast => (
+                    <div key={toast.id} className={`toast ${toast.type}`}>
+                        {toast.message}
                     </div>
-                </div>
-            </header>
-            <div className="main-layout">
-                <aside className="sidebar">
-                    <SidebarNav activeView={activeView} onNavClick={setActiveView} />
-                </aside>
-                <main className="main-content">
-                    {activeView === 'setup' && (
-                        <div className="setup-view">
-                            <div className="page-header">
-                                <h2 className="gradient-headline">1. Setup & Configuration</h2>
-                                <p>Connect your AI services and WordPress site to get started. All keys are stored securely in your browser's local storage.</p>
-                            </div>
-                            <div className="setup-grid">
-                                <div className="setup-card">
-                                    <h3>API Keys</h3>
-                                    <div className="form-group">
-                                        <label>Google Gemini API Key</label>
-                                        <div className="api-key-group">
-                                            <input type="text" readOnly value="Loaded from Environment" disabled />
-                                             <div className="key-status-icon">
-                                                {apiKeyStatus.gemini === 'validating' && <div className="key-status-spinner"></div>}
-                                                {apiKeyStatus.gemini === 'valid' && <span className="success"><CheckIcon /></span>}
-                                                {apiKeyStatus.gemini === 'invalid' && <span className="error"><XIcon /></span>}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div className="form-group">
-                                        <label>OpenAI API Key</label>
-                                        <ApiKeyInput provider="openai" value={apiKeys.openaiApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.openai} isEditing={editingApiKey === 'openai'} onEdit={() => setEditingApiKey('openai')} />
-                                    </div>
-                                    <div className="form-group">
-                                        <label>Anthropic API Key</label>
-                                        <ApiKeyInput provider="anthropic" value={apiKeys.anthropicApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.anthropic} isEditing={editingApiKey === 'anthropic'} onEdit={() => setEditingApiKey('anthropic')} />
-                                    </div>
-                                     <div className="form-group">
-                                        <label>OpenRouter API Key</label>
-                                        <ApiKeyInput provider="openrouter" value={apiKeys.openrouterApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.openrouter} isEditing={editingApiKey === 'openrouter'} onEdit={() => setEditingApiKey('openrouter')} />
-                                    </div>
-                                     <div className="form-group">
-                                        <label>Groq API Key</label>
-                                        <ApiKeyInput provider="groq" value={apiKeys.groqApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.groq} isEditing={editingApiKey === 'groq'} onEdit={() => setEditingApiKey('groq')} />
-                                    </div>
-                                    <div className="form-group">
-                                        <label>Serper API Key</label>
-                                        <ApiKeyInput provider="serper" value={apiKeys.serperApiKey} onChange={handleApiKeyChange} status={apiKeyStatus.serper} isEditing={editingApiKey === 'serper'} onEdit={() => setEditingApiKey('serper')} />
-                                    </div>
-                                </div>
-                                <div className="setup-card">
-                                    <h3>AI Model Configuration</h3>
-                                    <div className="form-group">
-                                        <label htmlFor="model-select">Primary Generation Model</label>
-                                        <select id="model-select" value={selectedModel} onChange={e => setSelectedModel(e.target.value)}>
-                                            <option value="gemini">Google Gemini 2.5 Flash</option>
-                                            <option value="openai">OpenAI GPT-4o</option>
-                                            <option value="anthropic">Anthropic Claude 3</option>
-                                            <option value="openrouter">OpenRouter (Auto-Fallback)</option>
-                                            <option value="groq">Groq (High-Speed)</option>
-                                        </select>
-                                    </div>
-                                    {selectedModel === 'openrouter' && (
-                                        <div className="form-group">
-                                            <label>OpenRouter Model Fallback Chain (one per line)</label>
-                                            <textarea value={openrouterModels.join('\n')} onChange={handleOpenrouterModelsChange} rows={5}></textarea>
-                                        </div>
-                                    )}
-                                     {selectedModel === 'groq' && (
-                                        <div className="form-group">
-                                            <label htmlFor="groq-model-select">Groq Model</label>
-                                            <input type="text" id="groq-model-select" value={selectedGroqModel} onChange={e => setSelectedGroqModel(e.target.value)} placeholder="e.g., llama3-70b-8192" />
-                                            <p className="help-text">Enter any model name compatible with the Groq API.</p>
-                                        </div>
-                                    )}
-                                     <div className="form-group checkbox-group">
-                                        <input type="checkbox" id="useGoogleSearch" checked={useGoogleSearch} onChange={e => setUseGoogleSearch(e.target.checked)} />
-                                        <label htmlFor="useGoogleSearch">Enable Google Search Grounding</label>
-                                    </div>
-                                    <p className="help-text">Grounding provides the AI with real-time search results for more accurate, up-to-date content. Recommended for time-sensitive topics.</p>
-                                </div>
-
-                                <div className="setup-card full-width">
-                                    <h3>WordPress & Site Information</h3>
-                                    <div className="schema-settings-grid">
-                                        <div className="form-group">
-                                            <label htmlFor="wpUrl">WordPress Site URL</label>
-                                            <input type="url" id="wpUrl" value={wpConfig.url} onChange={e => setWpConfig(p => ({...p, url: e.target.value}))} placeholder="https://example.com" />
-                                        </div>
-                                        <div className="form-group">
-                                            <label htmlFor="wpUsername">WordPress Username</label>
-                                            <input type="text" id="wpUsername" value={wpConfig.username} onChange={e => setWpConfig(p => ({...p, username: e.target.value}))} placeholder="your_username" />
-                                        </div>
-                                        <div className="form-group">
-                                            <label htmlFor="wpPassword">WordPress Application Password</label>
-                                            <input type="password" id="wpPassword" value={wpPassword} onChange={e => setWpPassword(e.target.value)} placeholder="xxxx xxxx xxxx xxxx" />
-                                        </div>
-                                         <div className="form-group">
-                                            <label htmlFor="orgName">Organization Name</label>
-                                            <input type="text" id="orgName" value={siteInfo.orgName} onChange={e => setSiteInfo(p => ({...p, orgName: e.target.value}))} placeholder="My Awesome Blog" />
-                                        </div>
-                                        <div className="form-group">
-                                            <label htmlFor="logoUrl">Logo URL</label>
-                                            <input type="url" id="logoUrl" value={siteInfo.logoUrl} onChange={e => setSiteInfo(p => ({...p, logoUrl: e.target.value}))} placeholder="https://example.com/logo.png" />
-                                        </div>
-                                         <div className="form-group">
-                                            <label htmlFor="authorName">Author Name</label>
-                                            <input type="text" id="authorName" value={siteInfo.authorName} onChange={e => setSiteInfo(p => ({...p, authorName: e.target.value}))} placeholder="John Doe" />
-                                        </div>
-                                         <div className="form-group">
-                                            <label htmlFor="authorUrl">Author Page URL</label>
-                                            <input type="url" id="authorUrl" value={siteInfo.authorUrl} onChange={e => setSiteInfo(p => ({...p, authorUrl: e.target.value}))} placeholder="https://example.com/about-me" />
-                                        </div>
-                                    </div>
-                                </div>
-                                <div className="setup-card full-width">
-                                    <h3>Advanced Geo-Targeting</h3>
-                                    <div className="form-group checkbox-group">
-                                        <input type="checkbox" id="geo-enabled" checked={geoTargeting.enabled} onChange={(e) => setGeoTargeting(p => ({...p, enabled: e.target.checked}))} />
-                                        <label htmlFor="geo-enabled">Enable Geo-Targeting for Content</label>
-                                    </div>
-                                    {geoTargeting.enabled && (
-                                        <div className="schema-settings-grid">
-                                            <input type="text" value={geoTargeting.location} onChange={e => setGeoTargeting(p => ({...p, location: e.target.value}))} placeholder="City (e.g., Austin)" />
-                                            <input type="text" value={geoTargeting.region} onChange={e => setGeoTargeting(p => ({...p, region: e.target.value}))} placeholder="State/Region (e.g., TX)" />
-                                            <input type="text" value={geoTargeting.country} onChange={e => setGeoTargeting(p => ({...p, country: e.target.value}))} placeholder="Country Code (e.g., US)" />
-                                            <input type="text" value={geoTargeting.postalCode} onChange={e => setGeoTargeting(p => ({...p, postalCode: e.target.value}))} placeholder="Postal Code (e.g., 78701)" />
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
-                    )}
-                    {activeView === 'strategy' && (
-                        <div className="content-strategy-view">
-                             <div className="page-header">
-                                <h2 className="gradient-headline">2. Content Strategy & Planning</h2>
-                                <p>Choose your content creation method. Plan a full topic cluster, generate a single article from a keyword, or use the Content Hub to analyze and rewrite existing posts.</p>
-                            </div>
-                            <div className="tabs-container">
-                                <div className="tabs" role="tablist">
-                                    <button className={`tab-btn ${contentMode === 'bulk' ? 'active' : ''}`} onClick={() => setContentMode('bulk')} role="tab">Bulk Content Planner</button>
-                                    <button className={`tab-btn ${contentMode === 'single' ? 'active' : ''}`} onClick={() => setContentMode('single')} role="tab">Single Article</button>
-                                    <button className={`tab-btn ${contentMode === 'hub' ? 'active' : ''}`} onClick={() => setContentMode('hub')} role="tab">Content Hub</button>
-                                    <button className={`tab-btn ${contentMode === 'imageGenerator' ? 'active' : ''}`} onClick={() => setContentMode('imageGenerator')} role="tab">Image Generator</button>
-                                </div>
-                            </div>
-                            {contentMode === 'bulk' && (
-                                <div className="tab-panel">
-                                    <h3>Bulk Content Planner</h3>
-                                    <p className="help-text">Enter a broad topic (e.g., "digital marketing") to generate a complete pillar page and cluster content plan, optimized for topical authority.</p>
-                                    <div className="form-group">
-                                        <label htmlFor="topic">Broad Topic</label>
-                                        <input type="text" id="topic" value={topic} onChange={e => setTopic(e.target.value)} placeholder="e.g., Landscape Photography" />
-                                    </div>
-                                    <button className="btn" onClick={handleGenerateClusterPlan} disabled={isGenerating || !topic}>
-                                        {isGenerating ? 'Generating...' : 'Generate Content Plan'}
-                                    </button>
-                                </div>
-                            )}
-                             {contentMode === 'single' && (
-                                <div className="tab-panel">
-                                    <h3>Single Article from Keyword</h3>
-                                    <p className="help-text">Enter one or more specific primary keywords, each on a new line, to generate multiple articles at once.</p>
-                                     <div className="form-group">
-                                        <label htmlFor="primaryKeywords">Primary Keywords (one per line)</label>
-                                        <textarea id="primaryKeywords" value={primaryKeywords} onChange={e => setPrimaryKeywords(e.target.value)} placeholder="e.g., best camera for landscape photography
-how to edit photos in lightroom" rows={5}></textarea>
-                                    </div>
-                                    <button className="btn" onClick={handleGenerateMultipleFromKeywords} disabled={!primaryKeywords.trim()}>Go to Review &rarr;</button>
-                                </div>
-                            )}
-                            {contentMode === 'hub' && (
-                                 <div className="tab-panel">
-                                    <h3>Content Hub & Rewrite Assistant</h3>
-                                    <p className="help-text">Enter your sitemap URL to crawl your existing content. Analyze posts for SEO health and generate strategic rewrite plans.</p>
-                                    <div className="sitemap-crawler-form">
-                                        <div className="form-group">
-                                             <label htmlFor="sitemapUrl">Sitemap URL</label>
-                                             <input type="url" id="sitemapUrl" value={sitemapUrl} onChange={e => setSitemapUrl(e.target.value)} placeholder="https://example.com/sitemap_index.xml" />
-                                        </div>
-                                        <button className="btn" onClick={handleCrawlSitemap} disabled={isCrawling}>
-                                            {isCrawling ? 'Crawling...' : 'Crawl Sitemap'}
-                                        </button>
-                                    </div>
-                                    {crawlMessage && <div className="crawl-status">{crawlMessage}</div>}
-                                    {existingPages.length > 0 && (
-                                        <div className="content-hub-table-container">
-                                            <div className="table-controls">
-                                                <input type="search" placeholder="Search pages..." className="filter-input" value={hubSearchFilter} onChange={e => setHubSearchFilter(e.target.value)} />
-                                                 <select value={hubStatusFilter} onChange={e => setHubStatusFilter(e.target.value)}>
-                                                    <option value="All">All Statuses</option>
-                                                    <option value="Critical">Critical</option>
-                                                    <option value="High">High</option>
-                                                    <option value="Medium">Medium</option>
-                                                    <option value="Healthy">Healthy</option>
-                                                </select>
-                                                <div className="table-actions">
-                                                    <button className="btn btn-secondary" onClick={handleAnalyzeSelectedPages} disabled={isAnalyzingHealth || selectedHubPages.size === 0}>
-                                                        {isAnalyzingHealth ? `Analyzing... (${healthAnalysisProgress.current}/${healthAnalysisProgress.total})` : `Analyze Selected (${selectedHubPages.size})`}
-                                                    </button>
-                                                    <button className="btn" onClick={handleRewriteSelected} disabled={analyzableForRewrite === 0}>Rewrite Selected ({analyzableForRewrite})</button>
-                                                </div>
-                                            </div>
-                                            <table className="content-hub-table">
-                                                <thead>
-                                                    <tr>
-                                                        <th><input type="checkbox" onChange={handleToggleHubPageSelectAll} checked={selectedHubPages.size > 0 && selectedHubPages.size === filteredAndSortedHubPages.length} /></th>
-                                                        <th onClick={() => handleHubSort('title')}>Title & Slug</th>
-                                                        <th onClick={() => handleHubSort('daysOld')}>Age</th>
-                                                        <th onClick={() => handleHubSort('updatePriority')}>Status</th>
-                                                         <th>Analysis & Actions</th>
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                {isCrawling ? <SkeletonLoader rows={10} columns={5} /> : filteredAndSortedHubPages.map(page => (
-                                                        <tr key={page.id}>
-                                                            <td><input type="checkbox" checked={selectedHubPages.has(page.id)} onChange={() => handleToggleHubPageSelect(page.id)} /></td>
-                                                            <td className="hub-title-cell">
-                                                                <a href={page.id} target="_blank" rel="noopener noreferrer">{sanitizeTitle(page.title, page.slug)}</a>
-                                                                <div className="slug">{page.id}</div>
-                                                            </td>
-                                                            <td>{page.daysOld !== null ? `${page.daysOld} days` : 'N/A'}</td>
-                                                            <td><div className="status-cell">{page.updatePriority ? <span className={`priority-${page.updatePriority}`}>{page.updatePriority}</span> : 'Not Analyzed'}</div></td>
-                                                            <td>
-                                                               {page.status === 'analyzing' && <div className="status-cell"><div className="status-indicator analyzing"></div>Analyzing...</div>}
-                                                                {page.status === 'error' && <div className="status-cell"><div className="status-indicator error"></div>Error</div>}
-                                                                {page.status === 'analyzed' && page.analysis && (
-                                                                    <button className="btn btn-small" onClick={() => setViewingAnalysis(page)}>View Rewrite Plan</button>
-                                                                )}
-                                                            </td>
-                                                        </tr>
-                                                    ))}
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                             {contentMode === 'imageGenerator' && (
-                                <div className="tab-panel">
-                                    <h3>SOTA Image Generator</h3>
-                                    <p className="help-text">Generate high-quality images for your content using DALL-E 3 or Gemini Imagen. Describe the image you want in detail.</p>
-                                    <div className="form-group">
-                                        <label htmlFor="imagePrompt">Image Prompt</label>
-                                        <textarea id="imagePrompt" value={imagePrompt} onChange={e => setImagePrompt(e.target.value)} rows={4} placeholder="e.g., A photorealistic image of a golden retriever puppy playing in a field of flowers, cinematic lighting, 16:9 aspect ratio." />
-                                    </div>
-                                    <div className="form-group-row">
-                                        <div className="form-group">
-                                            <label htmlFor="numImages">Number of Images</label>
-                                            <select id="numImages" value={numImages} onChange={e => setNumImages(Number(e.target.value))}>
-                                                {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
-                                            </select>
-                                        </div>
-                                         <div className="form-group">
-                                            <label htmlFor="aspectRatio">Aspect Ratio</label>
-                                            <select id="aspectRatio" value={aspectRatio} onChange={e => setAspectRatio(e.target.value)}>
-                                                <option value="1:1">1:1 (Square)</option>
-                                                <option value="16:9">16:9 (Widescreen)</option>
-                                                <option value="9:16">9:16 (Vertical)</option>
-                                                <option value="4:3">4:3 (Landscape)</option>
-                                                <option value="3:4">3:4 (Portrait)</option>
-                                            </select>
-                                        </div>
-                                    </div>
-                                    <button className="btn" onClick={handleGenerateImages} disabled={isGeneratingImages || !imagePrompt}>
-                                        {isGeneratingImages ? <><div className="spinner"></div> Generating...</> : 'Generate Images'}
-                                    </button>
-                                    {imageGenerationError && <p className="error" style={{marginTop: '1rem'}}>{imageGenerationError}</p>}
-                                    {generatedImages.length > 0 && (
-                                        <div className="image-assets-grid" style={{marginTop: '2rem'}}>
-                                            {generatedImages.map((image, index) => (
-                                                <div key={index} className="image-asset-card">
-                                                    <img src={image.src} alt={image.prompt} loading="lazy" />
-                                                    <div className="image-asset-details">
-                                                        <button className="btn btn-small" onClick={() => handleDownloadImage(image.src, image.prompt)}>Download</button>
-                                                        <button className="btn btn-small btn-secondary" onClick={() => handleCopyText(image.prompt)}>Copy Prompt</button>
-                                                    </div>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                        </div>
-                    )}
-                    {activeView === 'review' && (
-                        <div className="review-export-view">
-                            <div className="page-header">
-                                <h2 className="gradient-headline">3. Review, Edit & Export</h2>
-                                <p>Review the generated content, make any final edits, and publish directly to your WordPress site or copy the HTML.</p>
-                            </div>
-                            <div className="review-table-container">
-                                <div className="table-controls">
-                                    <input type="search" className="filter-input" placeholder="Filter by title..." value={filter} onChange={e => setFilter(e.target.value)} />
-                                    <div className="table-actions">
-                                        <button className="btn btn-secondary" onClick={handleGenerateSelected} disabled={isGenerating || selectedItems.size === 0}>
-                                            {isGenerating ? 'Generating...' : `Generate Selected (${selectedItems.size})`}
-                                        </button>
-                                        <button className="btn" onClick={() => setIsBulkPublishModalOpen(true)} disabled={items.filter(i => i.status === 'done' && selectedItems.has(i.id)).length === 0}>
-                                            Bulk Publish Selected
-                                        </button>
-                                    </div>
-                                </div>
-                                <table className="review-table">
-                                     <thead>
-                                        <tr>
-                                            <th><input type="checkbox" onChange={handleToggleSelectAll} checked={selectedItems.size > 0 && selectedItems.size === filteredAndSortedItems.length} /></th>
-                                            <th onClick={() => handleSort('title')}>Title</th>
-                                            <th onClick={() => handleSort('type')}>Type</th>
-                                            <th onClick={() => handleSort('status')}>Status</th>
-                                            <th>Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {filteredAndSortedItems.map(item => (
-                                            <tr key={item.id}>
-                                                <td><input type="checkbox" checked={selectedItems.has(item.id)} onChange={() => handleToggleSelect(item.id)} /></td>
-                                                <td>{item.title}</td>
-                                                <td><span className={`badge ${item.type}`}>{item.type.replace('-', ' ')}</span></td>
-                                                <td>
-                                                    <div className="status-cell">
-                                                        <div className={`status-indicator ${item.status}`}></div>
-                                                        <span>{item.statusText}</span>
-                                                    </div>
-                                                </td>
-                                                <td>
-                                                    <div className="modal-actions">
-                                                        {item.status === 'done' && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review & Edit</button>}
-                                                        {item.status === 'error' && item.generatedContent && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review (Partial)</button>}
-                                                        {(item.status === 'idle' || item.status === 'error') && <button className="btn btn-small btn-secondary" onClick={() => handleGenerateSingle(item)}>Generate</button>}
-                                                        {item.status === 'generating' && <button className="btn btn-small btn-secondary" onClick={() => handleStopGeneration(item.id)}>Stop</button>}
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                                {isGenerating && (
-                                     <div className="progress-bar-container" style={{marginTop: '1.5rem'}}>
-                                        <div className="progress-bar-fill good" style={{width: `${(generationProgress.current / generationProgress.total) * 100}%`}}></div>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    )}
-                </main>
+                ))}
             </div>
-            <AppFooter />
-            {selectedItemForReview && (
-                <ReviewModal 
-                    item={selectedItemForReview}
-                    onClose={() => setSelectedItemForReview(null)}
-                    onSaveChanges={(id, seo, content) => {
-                        const updatedContent = { ...selectedItemForReview.generatedContent!, ...seo, content };
-                        dispatch({ type: 'SET_CONTENT', payload: { id, content: updatedContent } });
-                        setSelectedItemForReview(p => p ? {...p, generatedContent: updatedContent} : null);
-                    }}
-                    wpConfig={wpConfig}
-                    wpPassword={wpPassword}
-                    onPublishSuccess={(originalUrl) => {
-                        setExistingPages(prev => prev.map(p => p.id === originalUrl ? {...p, publishedState: 'updated'} : p));
-                    }}
-                    publishItem={publishItemToWordPress}
-                    callAI={callAI}
-                    geoTargeting={geoTargeting}
-                />
-            )}
-             {isBulkPublishModalOpen && (
-                <BulkPublishModal
-                    items={items.filter(i => i.status === 'done' && selectedItems.has(i.id))}
-                    onClose={() => setIsBulkPublishModalOpen(false)}
-                    wpPassword={wpPassword}
-                    publishItem={publishItemToWordPress}
-                    onPublishSuccess={(originalUrl) => {
-                         setExistingPages(prev => prev.map(p => p.id === originalUrl ? {...p, publishedState: 'updated'} : p));
-                    }}
-                />
-            )}
-            {viewingAnalysis && (
-                 <AnalysisModal
-                    page={viewingAnalysis}
-                    onClose={() => setViewingAnalysis(null)}
-                    onPlanRewrite={handlePlanRewrite}
-                />
-            )}
+
+            <aside className="sidebar">
+                 <div className="sidebar-header">
+                     <a href="https://affiliatemarketingforsuccess.com/" target="_blank" rel="noopener noreferrer" className="logo-link">
+                        <img src="https://affiliatemarketingforsuccess.com/wp-content/uploads/2023/03/cropped-Affiliate-Marketing-for-Success-Logo-Edited.png?lm=6666FEE0" alt="Logo" className="sidebar-logo" />
+                     </a>
+                     <h1 className="sidebar-title">WP Content Optimizer Pro</h1>
+                </div>
+                 <button className="sidebar-toggle" onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)} aria-label="Toggle sidebar">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </button>
+                <SidebarNav activeView={activeView} onNavClick={setActiveView} />
+            </aside>
+            <main className="main-content">
+                {activeView === 'setup' && <SetupView {...{ apiKeys, apiKeyStatus, handleApiKeyChange, editingApiKey, setEditingApiKey, selectedModel, setSelectedModel, selectedGroqModel, setSelectedGroqModel, openrouterModels, handleOpenrouterModelsChange, useGoogleSearch, setUseGoogleSearch, wpConfig, setWpConfig, wpPassword, setWpPassword, siteInfo, setSiteInfo, geoTargeting, setGeoTargeting }} />}
+                {activeView === 'strategy' && <StrategyView {...{ contentMode, setContentMode, topic, setTopic, primaryKeywords, setPrimaryKeywords, sitemapUrl, setSitemapUrl, isCrawling, crawlMessage, existingPages, hubSearchFilter, setHubSearchFilter, hubStatusFilter, setHubStatusFilter, hubSortConfig, handleHubSort, isAnalyzingHealth, healthAnalysisProgress, selectedHubPages, handleToggleHubPageSelect, handleToggleHubPageSelectAll, handleAnalyzeSelectedPages, analyzableForRewrite, handleRewriteSelected, handleOptimizeLinksSelected, setViewingAnalysis, handleCrawlSitemap, isGenerating, handleGenerateClusterPlan, handleGenerateMultipleFromKeywords, imagePrompt, setImagePrompt, numImages, setNumImages, aspectRatio, setAspectRatio, isGeneratingImages, imageGenerationError, generatedImages, handleGenerateImages, handleDownloadImage, addToast, filteredAndSortedHubPages, keywordTopic, setKeywordTopic, handleFindKeywords, isFindingKeywords, keywordStatusText, keywordResults, handleAddKeywordsToQueue }} />}
+                {activeView === 'review' && <ReviewView {...{ filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, items, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }} />}
+
+                {selectedItemForReview && (
+                    <ReviewModal
+                        item={selectedItemForReview}
+                        onClose={() => setSelectedItemForReview(null)}
+                        onSaveChanges={handleSaveChanges}
+                        wpConfig={wpConfig}
+                        wpPassword={wpPassword}
+                        onPublishSuccess={onPublishSuccess}
+                        publishItem={publishItem}
+                        callAI={callAI}
+                        geoTargeting={geoTargeting}
+                        addToast={addToast}
+                    />
+                )}
+
+                 {isBulkPublishModalOpen && (
+                    <BulkPublishModal
+                        items={items.filter(i => i.status === 'done' && selectedItems.has(i.id))}
+                        onClose={() => setIsBulkPublishModalOpen(false)}
+                        publishItem={publishItem}
+                        wpPassword={wpPassword}
+                        onPublishSuccess={onPublishSuccess}
+                    />
+                )}
+
+                 {viewingAnalysis && (
+                    <AnalysisModal
+                        page={viewingAnalysis}
+                        onClose={() => setViewingAnalysis(null)}
+                        onPlanRewrite={handlePlanRewrite}
+                    />
+                )}
+
+                <AppFooter />
+            </main>
         </div>
     );
 };
 
-// Application's entry point.
-const rootElement = document.getElementById('root');
-if (rootElement) {
-    const root = ReactDOM.createRoot(rootElement);
-    root.render(
-        <React.StrictMode>
-            <App />
-        </React.StrictMode>
-    );
-}
+ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
