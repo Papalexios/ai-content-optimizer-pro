@@ -241,7 +241,8 @@ const extractJson = (text: string): string => {
 
     // Aggressively clean up common conversational text and markdown fences.
     let cleanedText = text
-        .replace(/^```(?:json)?\s*/, '') // Remove opening ```json or ```        .replace(/\s*```$/, '')           // Remove closing ```
+        .replace(/^```(?:json)?\s*/, '') // Remove opening ```json or ```
+        .replace(/\s*```$/, '')           // Remove closing ```
         .trim();
 
     // Remove any remaining markdown blocks
@@ -267,7 +268,7 @@ const extractJson = (text: string): string => {
     let potentialJson = cleanedText.substring(startIndex);
     
     // Find the balanced end bracket for the structure.
-    const startChar = potentialJson;
+    const startChar = potentialJson[0];
     const endChar = startChar === '{' ? '}' : ']';
     
     let balance = 1;
@@ -1674,7 +1675,6 @@ Select the best sources from the provided search results and return them in the 
     }
 };
 
-// SOTA FIX: Added rawAiResponseForDebug for better error handling
 type ContentItem = {
     id: string;
     title: string;
@@ -1685,7 +1685,6 @@ type ContentItem = {
     crawledContent: string | null;
     originalUrl?: string;
     analysis?: SitemapPage['analysis'];
-    rawAiResponseForDebug?: string | null; // Crucial for debugging crashes
 };
 
 type KeywordResult = {
@@ -1709,37 +1708,28 @@ type SeoCheck = {
 type ItemsAction =
     | { type: 'SET_ITEMS'; payload: Partial<ContentItem>[] }
     | { type: 'ADD_ITEMS'; payload: Partial<ContentItem>[] }
-    | { type: 'UPDATE_STATUS'; payload: { id: string; status: ContentItem['status']; statusText: string, rawResponse?: string } }
+    | { type: 'UPDATE_STATUS'; payload: { id: string; status: ContentItem['status']; statusText: string } }
     | { type: 'SET_CONTENT'; payload: { id: string; content: GeneratedContent } }
     | { type: 'SET_CRAWLED_CONTENT'; payload: { id: string; content: string } };
 
-// SOTA FIX: Updated reducer for better error handling and debugging
 const itemsReducer = (state: ContentItem[], action: ItemsAction): ContentItem[] => {
     switch (action.type) {
         case 'SET_ITEMS':
-            return action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null, rawAiResponseForDebug: null }));
+            return action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null }));
         case 'ADD_ITEMS':
-             const newItems = action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null, rawAiResponseForDebug: null }));
+             const newItems = action.payload.map((item: any) => ({ ...item, status: 'idle', statusText: 'Not Started', generatedContent: null, crawledContent: item.crawledContent || null, analysis: item.analysis || null }));
              const existingIds = new Set(state.map(item => item.id));
              return [...state, ...newItems.filter(item => !existingIds.has(item.id))];
         case 'UPDATE_STATUS':
-            return state.map(item => {
-                if (item.id !== action.payload.id) return item;
-                // When an error occurs, reset generatedContent to null to prevent render crashes
-                const shouldResetContent = action.payload.status === 'error';
-                return { 
-                    ...item, 
-                    status: action.payload.status, 
-                    statusText: action.payload.statusText,
-                    generatedContent: shouldResetContent ? null : item.generatedContent,
-                    // @ts-ignore - Allow adding debug info
-                    rawAiResponseForDebug: action.payload.rawResponse || item.rawAiResponseForDebug,
-                };
-            });
+            return state.map(item =>
+                item.id === action.payload.id
+                    ? { ...item, status: action.payload.status, statusText: action.payload.statusText }
+                    : item
+            );
         case 'SET_CONTENT':
             return state.map(item =>
                 item.id === action.payload.id
-                    ? { ...item, status: 'done', statusText: 'Completed', generatedContent: action.payload.content, rawAiResponseForDebug: null }
+                    ? { ...item, status: 'done', statusText: 'Completed', generatedContent: action.payload.content }
                     : item
             );
         case 'SET_CRAWLED_CONTENT':
@@ -2180,7 +2170,7 @@ const formatSerpUrl = (fullUrl: string): React.ReactNode => {
 };
 
 const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPublishSuccess, publishItem, callAI, geoTargeting, addToast }: ReviewModalProps) => {
-    if (!item) return null; // Guard against null item
+    if (!item || !item.generatedContent) return null;
 
     const [activeTab, setActiveTab] = useState('Live Preview');
     const [editedSeo, setEditedSeo] = useState({ title: '', metaDescription: '', slug: '' });
@@ -2221,12 +2211,6 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             if (editorRef.current) {
                 editorRef.current.scrollTop = 0;
             }
-        } else if (item && item.status === 'error') {
-            // If the item failed but has debug info, show it
-            setEditedContent('');
-            setDebouncedEditedContent('');
-            setEditedSeo({ title: item.title, metaDescription: '', slug: '' });
-            setActiveTab('Raw JSON'); // Default to showing the error
         }
     }, [item, wpConfig.url]);
 
@@ -2352,13 +2336,6 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
             setWpPublishMessage('Please fill in WordPress URL, Username, and Application Password in Step 1.');
             return;
         }
-        
-        if (!item.generatedContent) {
-            setWpPublishStatus('error');
-            setWpPublishMessage('Cannot publish, content has not been generated successfully.');
-            return;
-        }
-
 
         setWpPublishStatus('publishing');
         
@@ -2388,7 +2365,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
     };
 
     const TABS = ['Live Preview', 'Editor', 'Assets', 'Rank Guardian', 'Raw JSON'];
-    const hasContent = !!item.generatedContent;
+    const { primaryKeyword } = item.generatedContent;
     const isUpdate = !!item.originalUrl;
 
     let publishButtonText = 'Publish';
@@ -2415,93 +2392,74 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
 
                 <div className="tab-content">
                     {activeTab === 'Live Preview' && (
-                        hasContent ? (
-                            <div id="tab-panel-Live-Preview" role="tabpanel" className="live-preview" dangerouslySetInnerHTML={{ __html: previewContent }}></div>
-                        ) : (
-                            <div className="placeholder-tab">Content not available. Generation may have failed. Check "Raw JSON" tab for debug info.</div>
-                        )
+                        <div id="tab-panel-Live-Preview" role="tabpanel" className="live-preview" dangerouslySetInnerHTML={{ __html: previewContent }}></div>
                     )}
                     
                     {activeTab === 'Editor' && (
-                         hasContent ? (
-                            <div id="tab-panel-Editor" role="tabpanel" className="editor-tab-container">
-                                <div className="sota-editor-pro">
-                                    <pre className="line-numbers" ref={lineNumbersRef} aria-hidden="true">
-                                        {Array.from({ length: lineCount }, (_, i) => i + 1).join('\n')}
-                                    </pre>
-                                    <div className="editor-content-wrapper">
-                                        <div
-                                            ref={highlightRef}
-                                            className="editor-highlight-layer"
-                                            dangerouslySetInnerHTML={{ __html: highlightHtml(editedContent) }}
-                                        />
-                                        <textarea
-                                            ref={editorRef}
-                                            className="html-editor-input"
-                                            value={editedContent}
-                                            onChange={(e) => setEditedContent(e.target.value)}
-                                            onScroll={handleEditorScroll}
-                                            aria-label="HTML Content Editor"
-                                            spellCheck="false"
-                                        />
-                                    </div>
+                        <div id="tab-panel-Editor" role="tabpanel" className="editor-tab-container">
+                            <div className="sota-editor-pro">
+                                <pre className="line-numbers" ref={lineNumbersRef} aria-hidden="true">
+                                    {Array.from({ length: lineCount }, (_, i) => i + 1).join('\n')}
+                                </pre>
+                                <div className="editor-content-wrapper">
+                                    <div
+                                        ref={highlightRef}
+                                        className="editor-highlight-layer"
+                                        dangerouslySetInnerHTML={{ __html: highlightHtml(editedContent) }}
+                                    />
+                                    <textarea
+                                        ref={editorRef}
+                                        className="html-editor-input"
+                                        value={editedContent}
+                                        onChange={(e) => setEditedContent(e.target.value)}
+                                        onScroll={handleEditorScroll}
+                                        aria-label="HTML Content Editor"
+                                        spellCheck="false"
+                                    />
                                 </div>
                             </div>
-                         ) : (
-                            <div className="placeholder-tab">Content not available.</div>
-                         )
+                        </div>
                     )}
 
                     {activeTab === 'Assets' && (
-                        hasContent ? (
-                            <div id="tab-panel-Assets" role="tabpanel" className="assets-tab-container">
-                                <h3>Generated Images</h3>
-                                <p className="help-text" style={{fontSize: '1rem', maxWidth: '800px', margin: '0 0 2rem 0'}}>These images are embedded in your article. They will be automatically uploaded to your WordPress media library when you publish. You can also download them for manual use.</p>
-                                <div className="image-assets-grid">
-                                    {item.generatedContent!.imageDetails.map((image, index) => (
-                                        image.generatedImageSrc ? (
-                                            <div key={index} className="image-asset-card">
-                                                <img src={image.generatedImageSrc} alt={image.altText} loading="lazy" width="512" height="288" />
-                                                <div className="image-asset-details">
-                                                    <p><strong>Alt Text:</strong> {image.altText}</p>
-                                                    <button className="btn btn-small" onClick={() => handleDownloadImage(image.generatedImageSrc!, image.title)}>Download Image</button>
-                                                </div>
+                        <div id="tab-panel-Assets" role="tabpanel" className="assets-tab-container">
+                            <h3>Generated Images</h3>
+                            <p className="help-text" style={{fontSize: '1rem', maxWidth: '800px', margin: '0 0 2rem 0'}}>These images are embedded in your article. They will be automatically uploaded to your WordPress media library when you publish. You can also download them for manual use.</p>
+                            <div className="image-assets-grid">
+                                {item.generatedContent.imageDetails.map((image, index) => (
+                                    image.generatedImageSrc ? (
+                                        <div key={index} className="image-asset-card">
+                                            <img src={image.generatedImageSrc} alt={image.altText} loading="lazy" width="512" height="288" />
+                                            <div className="image-asset-details">
+                                                <p><strong>Alt Text:</strong> {image.altText}</p>
+                                                <button className="btn btn-small" onClick={() => handleDownloadImage(image.generatedImageSrc!, image.title)}>Download Image</button>
                                             </div>
-                                        ) : null
-                                    ))}
-                                </div>
+                                        </div>
+                                    ) : null
+                                ))}
                             </div>
-                        ) : (
-                             <div className="placeholder-tab">Assets not available.</div>
-                        )
+                        </div>
                     )}
 
                     {activeTab === 'Rank Guardian' && (
-                         hasContent ? (
-                             <div id="tab-panel-Rank-Guardian" role="tabpanel" className="rank-guardian-container">
-                                <RankGuardian 
-                                    item={item}
-                                    editedSeo={editedSeo}
-                                    editedContent={debouncedEditedContent}
-                                    onSeoChange={handleSeoChange}
-                                    onUrlChange={handleUrlChange}
-                                    onRegenerate={handleRegenerateSeo}
-                                    isRegenerating={isRegenerating}
-                                    isUpdate={isUpdate}
-                                    geoTargeting={geoTargeting}
-                                />
-                            </div>
-                         ) : (
-                            <div className="placeholder-tab">Analysis not available.</div>
-                         )
+                         <div id="tab-panel-Rank-Guardian" role="tabpanel" className="rank-guardian-container">
+                            <RankGuardian 
+                                item={item}
+                                editedSeo={editedSeo}
+                                editedContent={debouncedEditedContent}
+                                onSeoChange={handleSeoChange}
+                                onUrlChange={handleUrlChange}
+                                onRegenerate={handleRegenerateSeo}
+                                isRegenerating={isRegenerating}
+                                isUpdate={isUpdate}
+                                geoTargeting={geoTargeting}
+                            />
+                        </div>
                     )}
 
                     {activeTab === 'Raw JSON' && (
                         <pre id="tab-panel-Raw-JSON" role="tabpanel" className="json-viewer">
-                            {item.status === 'error' && item.rawAiResponseForDebug 
-                                ? `--- DEBUG INFO: RAW AI RESPONSE THAT CAUSED THE ERROR ---\n\n${item.rawAiResponseForDebug}`
-                                : JSON.stringify(item.generatedContent || { error: "No content generated." }, null, 2)
-                            }
+                            {JSON.stringify(item.generatedContent, null, 2)}
                         </pre>
                     )}
                 </div>
@@ -2512,9 +2470,9 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                     </div>
 
                     <div className="modal-actions">
-                        <button className="btn btn-secondary" onClick={() => { if(hasContent) { onSaveChanges(item.id, editedSeo, editedContent); addToast('Changes saved locally!', 'success'); }}}>Save Changes</button>
-                        <button className="btn btn-secondary" onClick={handleCopyHtml} disabled={!hasContent}>Copy HTML</button>
-                        <button className="btn btn-secondary" onClick={handleValidateSchema} disabled={!hasContent}>Validate Schema</button>
+                        <button className="btn btn-secondary" onClick={() => { onSaveChanges(item.id, editedSeo, editedContent); addToast('Changes saved locally!', 'success'); }}>Save Changes</button>
+                        <button className="btn btn-secondary" onClick={handleCopyHtml}>Copy HTML</button>
+                        <button className="btn btn-secondary" onClick={handleValidateSchema}>Validate Schema</button>
                         <div className="publish-action-group">
                             <select value={publishAction} onChange={e => setPublishAction(e.target.value as 'publish' | 'draft')} disabled={isUpdate}>
                                 <option value="publish">Publish</option>
@@ -2523,7 +2481,7 @@ const ReviewModal = ({ item, onClose, onSaveChanges, wpConfig, wpPassword, onPub
                             <button 
                                 className="btn"
                                 onClick={handlePublishToWordPress}
-                                disabled={wpPublishStatus === 'publishing' || !hasContent}
+                                disabled={wpPublishStatus === 'publishing'}
                             >
                                 {wpPublishStatus === 'publishing' ? publishingButtonText : publishButtonText}
                             </button>
@@ -3120,12 +3078,12 @@ how to edit photos in lightroom" rows={5}></textarea>
 ));
 
 interface ReviewViewProps {
-    items: ContentItem[];
     filter: string;
     setFilter: React.Dispatch<React.SetStateAction<string>>;
     isGenerating: boolean;
     selectedItems: Set<string>;
     handleGenerateSelected: () => void;
+    items: ContentItem[];
     handleToggleSelect: (id: string) => void;
     handleToggleSelectAll: () => void;
     filteredAndSortedItems: ContentItem[];
@@ -3139,7 +3097,7 @@ interface ReviewViewProps {
     };
     setIsBulkPublishModalOpen: React.Dispatch<React.SetStateAction<boolean>>;
 }
-const ReviewView = memo(({ items, filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }: ReviewViewProps) => (
+const ReviewView = memo(({ filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, items, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }: ReviewViewProps) => (
     <div className="review-export-view">
         <div className="page-header">
             <h2 className="gradient-headline">3. Review, Edit & Export</h2>
@@ -3181,7 +3139,8 @@ const ReviewView = memo(({ items, filter, setFilter, isGenerating, selectedItems
                             </td>
                             <td>
                                 <div className="modal-actions">
-                                    {(item.status === 'done' || item.status === 'error') && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review</button>}
+                                    {item.status === 'done' && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review & Edit</button>}
+                                    {item.status === 'error' && item.generatedContent && <button className="btn btn-small" onClick={() => setSelectedItemForReview(item)}>Review (Partial)</button>}
                                     {(item.status === 'idle' || item.status === 'error') && <button className="btn btn-small btn-secondary" onClick={() => handleGenerateSingle(item)}>Generate</button>}
                                     {item.status === 'generating' && <button className="btn btn-small btn-secondary" onClick={() => handleStopGeneration(item.id)}>Stop</button>}
                                 </div>
@@ -3225,7 +3184,7 @@ const App = () => {
     });
     const [apiKeyStatus, setApiKeyStatus] = useState({ gemini: 'idle', openai: 'idle', anthropic: 'idle', openrouter: 'idle', serper: 'idle', groq: 'idle' } as Record<string, 'idle' | 'validating' | 'valid' | 'invalid'>);
     const [editingApiKey, setEditingApiKey] = useState<string | null>(null);
-    const [apiClients, setApiClients] = useState<{ gemini: GoogleGenAI | null, openai: OpenAI | null, anthropic: Anthropic | null, openrouter: OpenAI | null, groq: OpenAI | null, openaiImages: OpenAI | null }>({ gemini: null, openai: null, anthropic: null, openrouter: null, groq: null, openaiImages: null });
+    const [apiClients, setApiClients] = useState<{ gemini: GoogleGenAI | null, openai: OpenAI | null, anthropic: Anthropic | null, openrouter: OpenAI | null, groq: OpenAI | null }>({ gemini: null, openai: null, anthropic: null, openrouter: null, groq: null });
     const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem('selectedModel') || 'gemini');
     const [selectedGroqModel, setSelectedGroqModel] = useState(() => localStorage.getItem('selectedGroqModel') || AI_MODELS.GROQ_MODELS[0]);
     const [openrouterModels, setOpenrouterModels] = useState<string[]>(AI_MODELS.OPENROUTER_DEFAULT);
@@ -3306,10 +3265,7 @@ const App = () => {
     useEffect(() => { localStorage.setItem('geoTargeting', JSON.stringify(geoTargeting)); }, [geoTargeting]);
     useEffect(() => { localStorage.setItem('siteInfo', JSON.stringify(siteInfo)); }, [siteInfo]);
 
-    // SOTA FIX: This new hook correctly initializes all API clients, including the
-    // dedicated, separate client for OpenAI image generation to prevent freezes.
     useEffect(() => {
-        // --- Gemini (Environment Variable) ---
         (async () => {
             if (process.env.API_KEY) {
                 try {
@@ -3319,36 +3275,17 @@ const App = () => {
                     setApiClients(prev => ({ ...prev, gemini: geminiClient }));
                     setApiKeyStatus(prev => ({...prev, gemini: 'valid' }));
                 } catch (e) {
+                    console.error("Gemini client initialization/validation failed:", e);
                     setApiClients(prev => ({ ...prev, gemini: null }));
                     setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
                 }
             } else {
+                console.error("Gemini API key (API_KEY environment variable) is not set.");
+                setApiClients(prev => ({ ...prev, gemini: null }));
                 setApiKeyStatus(prev => ({...prev, gemini: 'invalid' }));
             }
         })();
-
-        // SOTA FIX: Create a DEDICATED client for OpenAI Image Generation.
-        // This client is SEPARATE from the main text client and is NEVER pointed at OpenRouter.
-        // This is the core fix that prevents the application freeze.
-        if (apiKeys.openaiApiKey) {
-            try {
-                const imageClient = new OpenAI({ apiKey: apiKeys.openaiApiKey, dangerouslyAllowBrowser: true });
-                setApiClients(prev => ({ ...prev, openaiImages: imageClient })); // Add the new client
-            } catch (e) {
-                console.error("Failed to initialize dedicated OpenAI Image client:", e);
-                setApiClients(prev => ({ ...prev, openaiImages: null }));
-            }
-        } else {
-             setApiClients(prev => ({ ...prev, openaiImages: null }));
-        }
-
-        // --- Validate other keys on change ---
-        Object.entries(apiKeys).forEach(([key, value]) => {
-            if (value && key !== 'openaiApiKey') { // OpenAI key is handled by text-specific validation
-                validateApiKey(key.replace('ApiKey', ''), value as string);
-            }
-        });
-    }, [apiKeys.openaiApiKey]); // Rerun when the primary OpenAI key changes to update the image client too.
+    }, []);
 
 
     useEffect(() => {
@@ -4186,16 +4123,20 @@ const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
         setIsGenerating(true);
         setGenerationProgress({ current: 0, total: itemsToGenerate.length });
         
+        // SOTA FIX: A configurable constant for concurrency. 
+        // 5 was too high for your API plan, causing the 429 error.
+        // Starting with 2 or 3 is a much safer approach to avoid rate limits.
         const MAX_CONCURRENT_JOBS = 3;
 
         await processConcurrently(
             itemsToGenerate,
             (item) => generateSingleItem(item),
-            MAX_CONCURRENT_JOBS,
+            MAX_CONCURRENT_JOBS, // Use the new constant here
             (completed, total) => {
                 setGenerationProgress({ current: completed, total: total });
             },
             () => {
+                // Checks if any item has been flagged to stop the entire queue.
                 const shouldStop = itemsToGenerate.some(item => stopGenerationRef.current.has(item.id));
                 if (shouldStop) {
                     console.log("Stop signal received, halting generation queue.");
@@ -4205,7 +4146,7 @@ const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
         );
 
         setIsGenerating(false);
-        stopGenerationRef.current.clear();
+        stopGenerationRef.current.clear(); // Clear stop signals after the queue is finished
     };
 
     const handleGenerateSingle = (item: ContentItem) => {
@@ -4243,44 +4184,25 @@ const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
         }
     };
 
-    // SOTA FIX: The new, freeze-proof image generation function that uses a dedicated client.
     const generateImageWithFallback = useCallback(async (prompt: string): Promise<string | null> => {
-        const imageClient = apiClients.openaiImages;
-        
-        // --- ATTEMPT 1: OpenAI DALL-E 3 (via the dedicated client) ---
-        if (imageClient && apiKeyStatus.openai === 'valid') {
+        if (apiClients.openai && apiKeyStatus.openai === 'valid') {
             try {
-                console.log("Attempting image generation with dedicated OpenAI DALL-E 3 client...");
-                const openaiImgResponse = await callAiWithRetry(() => imageClient.images.generate({ 
-                    model: AI_MODELS.OPENAI_DALLE3, 
-                    prompt, 
-                    n: 1, 
-                    size: '1792x1024', 
-                    response_format: 'b64_json' 
-                }));
+                console.log("Attempting image generation with OpenAI DALL-E 3...");
+                const openaiImgResponse = await callAiWithRetry(() => apiClients.openai!.images.generate({ model: AI_MODELS.OPENAI_DALLE3, prompt, n: 1, size: '1792x1024', response_format: 'b64_json' }));
                 const base64Image = openaiImgResponse.data[0].b64_json;
                 if (base64Image) {
                     console.log("OpenAI image generation successful.");
                     return `data:image/png;base64,${base64Image}`;
                 }
             } catch (error: any) {
-                console.warn("Dedicated OpenAI image generation failed. Falling back to Gemini.", error);
+                console.warn("OpenAI image generation failed, falling back to Gemini.", error);
             }
         }
 
-        // --- ATTEMPT 2: Google Gemini Imagen (Fallback) ---
         if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
             try {
                  console.log("Attempting image generation with Google Gemini Imagen...");
-                 const geminiImgResponse = await callAiWithRetry(() => apiClients.gemini!.models.generateImages({ 
-                     model: AI_MODELS.GEMINI_IMAGEN, 
-                     prompt: prompt, 
-                     config: { 
-                         numberOfImages: 1, 
-                         outputMimeType: 'image/jpeg', 
-                         aspectRatio: '16:9' 
-                     } 
-                 }));
+                 const geminiImgResponse = await callAiWithRetry(() => apiClients.gemini!.models.generateImages({ model: AI_MODELS.GEMINI_IMAGEN, prompt: prompt, config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' } }));
                  const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
                  if (base64Image) {
                     console.log("Gemini image generation successful.");
@@ -4291,10 +4213,12 @@ const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
             }
         }
         
-        console.error("All image generation services failed or are unavailable. Please check API keys.");
+        console.error("All image generation services failed or are unavailable.");
         return null;
     }, [apiClients, apiKeyStatus]);
     
+    // FIX: The `promptKey` type was too broad, causing a TypeScript error.
+    // It's been narrowed to exclude 'contentTemplates', which doesn't fit the expected structure.
     const callAI = useCallback(async (
         promptKey: Exclude<keyof typeof PROMPT_TEMPLATES, 'contentTemplates'>,
         promptArgs: any[],
@@ -4509,153 +4433,288 @@ const runGenerationQueue = async (itemsToGenerate: ContentItem[]) => {
         return collectedReferences.slice(0, 12);
     }, [callAI, apiKeys.serperApiKey]);
 
-    // SOTA FIX: The complete, new, crash-proof function.
     const generateSingleItem = useCallback(async (item: ContentItem) => {
-        if (stopGenerationRef.current.has(item.id)) {
-            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'idle', statusText: 'Stopped by user' } });
-            return;
-        }
+        if (stopGenerationRef.current.has(item.id)) return;
 
-        // SOTA FIX 1: PRE-FLIGHT CHECK GUARDIAN
+        // 👇 --- ADD THIS NEW PRE-FLIGHT CHECK BLOCK --- 👇
         if (!apiKeys.serperApiKey || apiKeyStatus.serper !== 'valid') {
-            const errorMessage = "STOPPING: Serper API key is missing or invalid in Step 1. This is REQUIRED for references.";
-            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'error', statusText: errorMessage } });
-            return; // HALT EXECUTION
+            const errorMessage = "Cannot generate references. The Serper API key is missing or invalid. Please configure it in Step 1 (Setup) to proceed.";
+            dispatch({
+                type: 'UPDATE_STATUS',
+                payload: { id: item.id, status: 'error', statusText: errorMessage }
+            });
+            console.error(errorMessage);
+            return; // Stop the function immediately.
         }
+        // --- END OF NEW PRE-FLIGHT CHECK ---
 
         dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Initializing...' } });
 
-        let rawOutlineResponseForDebug: string = '';
+        let rawResponseForDebugging: any = null;
         let processedContent: GeneratedContent | null = null;
-
+        
         try {
             if (item.type === 'link-optimizer') {
-                // ... (your existing, correct link-optimizer code) ...
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/2: Fetching original content...' } });
+                if (!item.originalUrl) throw new Error("Original URL is missing for link optimization.");
+                const pageResponse = await fetchWithProxies(item.originalUrl);
+                const originalHtml = await pageResponse.text();
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalHtml.replace(/<script[^>]*>.*?<\/script>/gi, '');
+                const mainContentElement = tempDiv.querySelector('main, article, .main-content, #main, #content, .post-content, [role="main"]');
+                if (!mainContentElement) throw new Error("Could not extract main content from the page to optimize.");
+                const contentToOptimize = mainContentElement.innerHTML;
+                
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/2: Optimizing Internal Links...' } });
+                const optimizedContentHtml = await callAI('internal_link_optimizer', [contentToOptimize, existingPages], 'html');
+                const finalOptimizedInnerContent = sanitizeHtmlResponse(optimizedContentHtml);
+                const originalTitle = tempDiv.querySelector('title')?.textContent || item.title;
+                const originalMetaDesc = tempDiv.querySelector('meta[name="description"]')?.getAttribute('content') || `Updated content for ${originalTitle}`;
+
+                const finalContentPayload = normalizeGeneratedContent({
+                    title: originalTitle, slug: extractSlugFromUrl(item.originalUrl!), metaDescription: originalMetaDesc,
+                    content: finalOptimizedInnerContent, primaryKeyword: originalTitle, semanticKeywords: [], imageDetails: [],
+                    strategy: { targetAudience: 'N/A', searchIntent: 'N/A', competitorAnalysis: 'N/A', contentAngle: 'Internal Link Optimization' },
+                    jsonLdSchema: {}, socialMediaCopy: { twitter: '', linkedIn: '' }
+                }, item.title);
+
+                finalContentPayload.content = processInternalLinks(finalContentPayload.content, existingPages);
+                finalContentPayload.jsonLdSchema = generateFullSchema(finalContentPayload, wpConfig, siteInfo, [], geoTargeting);
+                dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: finalContentPayload } });
                 return;
             }
              
-            let serpData: any[] | null = null, peopleAlsoAsk: string[] | null = null, youtubeVideos: any[] | null = null, contentBrief: any | null = null, semanticKeywords: string[] | null = null;
+            let serpData: any[] | null = null;
+            let peopleAlsoAsk: string[] | null = null;
+            let youtubeVideos: any[] | null = null;
+            let contentBrief: any | null = null;
+            let semanticKeywords: string[] | null = null;
             const isPillar = item.type === 'pillar';
 
-            // ... (your existing, safe data fetching logic for Serper, brief, keywords) ...
+            if (apiKeys.serperApiKey && apiKeyStatus.serper === 'valid') {
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 1/7: Fetching SERP Data...' } });
+                const cacheKey = `serp-${item.title}`;
+                const cachedSerp = apiCache.get(cacheKey);
+                if (cachedSerp) {
+                     serpData = cachedSerp.serpData; youtubeVideos = cachedSerp.youtubeVideos; peopleAlsoAsk = cachedSerp.peopleAlsoAsk;
+                } else {
+                    try {
+                        const serperResponse = await fetchWithProxies("https://google.serper.dev/search", { method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: item.title }) });
+                        if (!serperResponse.ok) throw new Error(`Serper API failed with status ${serperResponse.status}`);
+                        const serperJson = await serperResponse.json();
+                        serpData = serperJson.organic ? serperJson.organic.slice(0, 10) : [];
+                        peopleAlsoAsk = serperJson.peopleAlsoAsk ? serperJson.peopleAlsoAsk.map((p: any) => p.question) : [];
+                        const videoCandidates = new Map<string, any>();
+                        const videoQueries = [`"${item.title}" tutorial`, `how to ${item.title}`, item.title];
+                        for (const query of videoQueries) {
+                            if (videoCandidates.size >= 10) break;
+                            try {
+                                const videoResponse = await fetchWithProxies("https://google.serper.dev/videos", { method: 'POST', headers: { 'X-API-KEY': apiKeys.serperApiKey as string, 'Content-Type': 'application/json' }, body: JSON.stringify({ q: query }) });
+                                if (videoResponse.ok) {
+                                    const json = await videoResponse.json();
+                                    for (const v of (json.videos || [])) {
+                                        const videoId = extractYouTubeID(v.link);
+                                        if (videoId && !videoCandidates.has(videoId)) videoCandidates.set(videoId, { ...v, videoId });
+                                    }
+                                }
+                            } catch (e) { console.warn(`Video search failed for "${query}".`, e); }
+                        }
+                        youtubeVideos = getUniqueYoutubeVideos(Array.from(videoCandidates.values()), YOUTUBE_EMBED_COUNT);
+                        apiCache.set(cacheKey, { serpData, youtubeVideos, peopleAlsoAsk });
+                    } catch (serpError) { console.error("Failed to fetch SERP data:", serpError); }
+                }
+            }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
 
-            // STAGE 4: GENERATE OUTLINE
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 2/7: Creating Content Brief...' } });
+            const briefText = await callAI('content_brief_generator', [item.title, serpData], 'json');
+            contentBrief = JSON.parse(extractJson(briefText));
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
+            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 3/7: Generating Semantic Keywords...' } });
+            const skCacheKey = `sk-${item.title}`;
+            if (apiCache.get(skCacheKey)) {
+                semanticKeywords = apiCache.get(skCacheKey);
+            } else {
+                const skResponseText = await callAI('semantic_keyword_generator', [item.title], 'json');
+                const parsedSk = JSON.parse(extractJson(skResponseText));
+                semanticKeywords = parsedSk.semanticKeywords;
+                apiCache.set(skCacheKey, semanticKeywords);
+            }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+
             dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/7: Generating Article Outline...' } });
             const templateName = getContentTemplate(item.title);
             const contentTemplate = PROMPT_TEMPLATES.contentTemplates[templateName as keyof typeof PROMPT_TEMPLATES.contentTemplates];
-            rawOutlineResponseForDebug = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, peopleAlsoAsk, existingPages, item.crawledContent, item.analysis, contentBrief, contentTemplate], 'json', useGoogleSearch);
+            // ... inside generateSingleItem function
+const outlineResponseText = await callAI('content_meta_and_outline', [item.title, semanticKeywords, serpData, peopleAlsoAsk, existingPages, item.crawledContent, item.analysis, contentBrief, contentTemplate], 'json', useGoogleSearch);
+rawResponseForDebugging = outlineResponseText;
+const metaAndOutline = JSON.parse(extractJson(outlineResponseText));
 
-            let metaAndOutline: any;
-            try {
-                metaAndOutline = JSON.parse(extractJson(rawOutlineResponseForDebug));
-            } catch (e: any) {
-                throw new Error(`CRITICAL FAILURE: The AI's response was not valid JSON.`);
-            }
-            if (typeof metaAndOutline !== 'object' || metaAndOutline === null) {
-                throw new Error(`CRITICAL FAILURE: The AI returned valid JSON, but it is not a usable object.`);
-            }
+// SOTA FIX: Enforce SEO-friendly image filenames based on the primary keyword.
+// This overrides any filename the AI might have hallucinated, ensuring consistency and SEO value.
+if (metaAndOutline.imageDetails && Array.isArray(metaAndOutline.imageDetails)) {
+    // 1. Get the primary keyword and create a clean, URL-safe slug from it.
+    const primaryKeyword = metaAndOutline.primaryKeyword || item.title;
+    const keywordSlug = primaryKeyword
+        .toLowerCase()
+        .replace(/\s+/g, '-') // Replace spaces with hyphens
+        .replace(/[^\w-]+/g, '') // Remove all non-word chars except hyphens
+        .replace(/--+/g, '-') // Replace multiple hyphens with a single one
+        .replace(/^-+|-+$/g, ''); // Trim hyphens from start/end
 
-            // STAGE 5: CRASH-PROOF CONTENT ASSEMBLY
-            let contentParts: string[] = [];
-            if (metaAndOutline.introduction && typeof metaAndOutline.introduction === 'string') contentParts.push(metaAndOutline.introduction);
-            if (metaAndOutline.keyTakeaways && Array.isArray(metaAndOutline.keyTakeaways)) contentParts.push(`<h3>Key Takeaways</h3><ul>${metaAndOutline.keyTakeaways.map(t => `<li>${t || ''}</li>`).join('')}</ul>`);
+    // 2. Loop through the image details and overwrite the 'title' (which becomes the filename).
+    metaAndOutline.imageDetails.forEach((imageDetail: any, index: number) => {
+        // Use a descriptive suffix to avoid name collisions.
+        const suffix = (imageDetail.prompt && imageDetail.prompt.toLowerCase().includes('infographic')) ? `infographic-${index + 1}` : `image-${index + 1}`;
+        const newFilename = `${keywordSlug}-${suffix}`;
+        
+        console.log(`[Filename Enforcer] Overwriting AI-generated image title "${imageDetail.title}" with SEO-optimized filename: "${newFilename}"`);
+        imageDetail.title = newFilename;
+    });
+}
 
+metaAndOutline.introduction = sanitizeHtmlResponse(metaAndOutline.introduction);
+metaAndOutline.conclusion = sanitizeHtmlResponse(metaAndOutline.conclusion);
+// ...
+
+            let contentParts: string[] = [metaAndOutline.introduction, `<h3>Key Takeaways</h3>\n<ul>\n${metaAndOutline.keyTakeaways.map((t: string) => `<li>${t}</li>`).join('\n')}\n</ul>`];
             const sections = metaAndOutline.outline;
-            if (sections && Array.isArray(sections)) {
-                for (let i = 0; i < sections.length; i++) {
-                    if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
-                    const sectionTitle = sections[i];
-                    if (!sectionTitle || typeof sectionTitle !== 'string') continue;
-                    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 5/7: Writing section ${i + 1}/${sections.length}...` } });
-                    const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, sectionTitle, existingPages, serpData], 'html');
-                    contentParts.push(`<h2>${sectionTitle}</h2>${sanitizeHtmlResponse(sectionHtml)}`);
+            for (let i = 0; i < sections.length; i++) {
+                if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 5/7: Writing section ${i + 1} of ${sections.length}...` } });
+                let sectionContent = `<h2>${sections[i]}</h2>`;
+                const sectionHtml = await callAI('write_article_section', [item.title, metaAndOutline.title, sections[i], existingPages, serpData], 'html');
+                sectionContent += sanitizeHtmlResponse(sectionHtml);
+                contentParts.push(sectionContent);
+                if (youtubeVideos?.length) {
+                    if (i === 1 && youtubeVideos[0]) contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[0].embedUrl}" title="${youtubeVideos[0].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
+                    if (i === Math.floor(sections.length / 2) && youtubeVideos[1]) contentParts.push(`<div class="video-container"><iframe width="100%" height="410" src="${youtubeVideos[1].embedUrl}" title="${youtubeVideos[1].title}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe></div>`);
                 }
             }
-            if (metaAndOutline.conclusion && typeof metaAndOutline.conclusion === 'string') contentParts.push(metaAndOutline.conclusion);
-            
+            contentParts.push(metaAndOutline.conclusion);
             const fullFaqData: { question: string, answer: string }[] = [];
-            // ... (Your existing FAQ logic)
-
-            // SOTA FIX 2: ARCHITECTURALLY SOUND REFERENCE INJECTION
-            const tempContentForSummary = contentParts.join('\n\n');
-            dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 7/7: Verifying Sources...` } });
-            
-            const verifiedReferences = await generateReferencesWithEnforcement(metaAndOutline.title, metaAndOutline.primaryKeyword, tempContentForSummary, serpData);
-            
-            if (verifiedReferences && verifiedReferences.length > 0) {
-                let referencesHtml = '<h2>References</h2><ol>';
-                for (const ref of verifiedReferences) {
-                    if (ref.title && ref.url && ref.source && ref.year) {
-                        referencesHtml += `<li><a href="${ref.url}" target="_blank" rel="noopener noreferrer">${String(ref.title).replace(/</g, '&lt;')}</a> (${String(ref.source).replace(/</g, '&lt;')}, ${ref.year})</li>`;
+            const faqQuestions = metaAndOutline.faqSection.map((faq: any) => faq.question);
+            if (faqQuestions.length > 0) {
+                dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 5/7: Answering ${faqQuestions.length} FAQs...` } });
+                const faqResponseText = await callAI('write_faq_section', [faqQuestions], 'json');
+                const { faqs: answeredFaqs } = JSON.parse(extractJson(faqResponseText));
+                if (answeredFaqs?.length > 0) {
+                    contentParts.push(`<div class="faq-section"><h2>Frequently Asked Questions</h2>`);
+                    for (const faq of answeredFaqs) {
+                        if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
+                        const cleanAnswer = sanitizeHtmlResponse(faq.answer).replace(/^<p>|<\/p>$/g, '');
+                        contentParts.push(`<h3>${faq.question}</h3>\n<p>${cleanAnswer}</p>`);
+                        fullFaqData.push({ question: faq.question, answer: cleanAnswer });
                     }
+                    contentParts.push(`</div>`);
                 }
-                referencesHtml += '</ol>';
-                contentParts.push(referencesHtml);
-            } else {
-                console.warn("[REFERENCE GUARDIAN] Could not find valid sources. Article will have no references section.");
             }
+            if (stopGenerationRef.current.has(item.id)) throw new Error("Stopped by user");
 
             let finalContent = contentParts.join('\n\n');
-
-            // STAGE 6: IMAGE GENERATION
             dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 6/7: Generating Images...` } });
-            const updatedImageDetails = [...(metaAndOutline.imageDetails || [])];
+            const updatedImageDetails = [...metaAndOutline.imageDetails];
             for (let i = 0; i < updatedImageDetails.length; i++) {
+                if (stopGenerationRef.current.has(item.id)) break;
                 const imageDetail = updatedImageDetails[i];
-                if (imageDetail.prompt) {
+                try {
                     const generatedImageSrc = await generateImageWithFallback(imageDetail.prompt);
                     if (generatedImageSrc) {
                         imageDetail.generatedImageSrc = generatedImageSrc;
                         finalContent = finalContent.replace(imageDetail.placeholder, `<figure class="wp-block-image size-large"><img src="${generatedImageSrc}" alt="${imageDetail.altText}" title="${imageDetail.title}"/><figcaption>${imageDetail.altText}</figcaption></figure>`);
-                    }
+                    } else finalContent = finalContent.replace(imageDetail.placeholder, '');
+                } catch (imgError) {
+                    console.error(`Failed to generate image for prompt: "${imageDetail.prompt}"`, imgError);
+                    finalContent = finalContent.replace(imageDetail.placeholder, '');
                 }
-                if(imageDetail.placeholder) finalContent = finalContent.replace(imageDetail.placeholder, '');
             }
             finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, '');
+            
+// --- NEW SOTA "REFERENCE GUARDIAN" SYSTEM ---
+            // --- SOTA FIX: REFERENCE GUARDIAN & INJECTION SYSTEM ---
+dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 7/7: Verifying Sources & Finalizing...` } });
 
-            // STAGE 8: FINAL POLISHING
-            finalContent = sanitizeBrokenPlaceholders(finalContent);
-            finalContent = deduplicateInternalLinks(finalContent);
-            finalContent = validateAndRepairInternalLinks(finalContent, existingPages);
-            finalContent = enforceInternalLinkQuota(finalContent, existingPages, metaAndOutline.primaryKeyword, MIN_INTERNAL_LINKS);
-            finalContent = processInternalLinks(finalContent, existingPages);
+// Step 1: ALWAYS generate a high-quality, verified list of references using your robust process.
+// This happens independently of the AI model's capabilities.
+const contentSummaryForRefs = finalContent.replace(/<[^>]+>/g, ' ').substring(0, 2000);
+const verifiedReferences = await generateReferencesWithEnforcement(
+    metaAndOutline.title,
+    metaAndOutline.primaryKeyword,
+    contentSummaryForRefs,
+    serpData
+);
+
+// Step 2: Check if the AI-generated content ALREADY has a satisfactory references section.
+// We look for a heading and at least a few list items with links to avoid false positives.
+const hasExistingReferences = /<h2[^>]*>References<\/h2>[\s\S]*?<li>[\s\S]*?<a href/i.test(finalContent);
+
+// Step 3: If references are missing AND you found verified ones, inject them.
+if (!hasExistingReferences && verifiedReferences && verifiedReferences.length > 0) {
+    console.log(`[Reference Guardian] The selected model (${selectedModel}) failed to provide a references section. Programmatically injecting ${verifiedReferences.length} verified sources.`);
+    
+    // Build the clean, clickable HTML for the references.
+    let referencesHtml = '<h2>References</h2>\n<ol>\n';
+    for (const ref of verifiedReferences) {
+        // Final validation check before rendering.
+        if (ref.title && ref.url && ref.source && ref.year) {
+            const safeTitle = ref.title.replace(/</g, '&lt;');
+            const safeSource = ref.source.replace(/</g, '&lt;');
+            referencesHtml += `<li><a href="${ref.url}" target="_blank" rel="noopener noreferrer">${safeTitle}</a> (${safeSource}, ${ref.year})</li>\n`;
+        }
+    }
+    referencesHtml += '</ol>';
+    
+    // Append the verified references to the end of the article content.
+    finalContent += '\n\n' + referencesHtml;
+} else if (hasExistingReferences) {
+     console.log(`[Reference Guardian] The selected model (${selectedModel}) successfully included a references section. No injection needed.`);
+} else {
+     console.warn(`[Reference Guardian] No references were injected because either the model included them or no verified sources could be found.`);
+}
+            // --- END OF NEW SYSTEM ---
+            
+// --- This is the NEW, FIXED code block ---
+            finalContent = sanitizeBrokenPlaceholders(finalContent); // 1. Clean up malformed placeholders first.
+            finalContent = deduplicateInternalLinks(finalContent);   // 2. NEW: Remove any duplicate links the AI created.
+            finalContent = validateAndRepairInternalLinks(finalContent, existingPages); // 3. Repair any remaining invalid links.
+            finalContent = enforceInternalLinkQuota(finalContent, existingPages, metaAndOutline.primaryKeyword, MIN_INTERNAL_LINKS); // 4. Add new links if needed (this already prevents adding duplicates).
+            finalContent = processInternalLinks(finalContent, existingPages); // 5. Convert all valid placeholders to <a> tags.
             finalContent = enforceUniqueVideoEmbeds(finalContent, youtubeVideos || []);
             enforceWordCount(finalContent, isPillar ? TARGET_MIN_WORDS_PILLAR : TARGET_MIN_WORDS, isPillar ? TARGET_MAX_WORDS_PILLAR : TARGET_MAX_WORDS);
             checkHumanWritingScore(finalContent);
-
+            
             processedContent = normalizeGeneratedContent({ ...metaAndOutline, content: finalContent, imageDetails: updatedImageDetails, serpData }, item.title);
             processedContent = injectRankingTriggers(processedContent);
-            
-            // FINAL FILENAME ENFORCER
-            if (processedContent.imageDetails && Array.isArray(processedContent.imageDetails)) {
-                const keywordSlug = (processedContent.primaryKeyword || processedContent.title).toLowerCase().replace(/\s+/g, '-').replace(/[^\w-]+/g, '').replace(/--+/g, '-').replace(/^-+|-+$/g, '');
-                processedContent.imageDetails.forEach((imageDetail, index) => {
-                    const suffix = (imageDetail.prompt && imageDetail.prompt.toLowerCase().includes('infographic')) ? `infographic-${index + 1}` : `feature-image-${index + 1}`;
-                    const newFilename = `${keywordSlug}-${suffix}`;
-                    console.log(`[FINAL FILENAME ENFORCER] Filename set to: "${newFilename}"`);
-                    imageDetail.title = newFilename;
-                });
-            }
-            
             processedContent.jsonLdSchema = generateFullSchema(processedContent, wpConfig, siteInfo, fullFaqData, geoTargeting);
             dispatch({ type: 'SET_CONTENT', payload: { id: item.id, content: processedContent } });
+} catch (error: any) {
+            console.error(`Error generating item "${item.title}":`, error);
+            console.error("RAW AI RESPONSE FOR DEBUGGING:", rawResponseForDebugging);
 
-        } catch (error: any) {
-            console.error(`FATAL ERROR for item "${item.title}":`, error);
-            console.error("RAW AI RESPONSE THAT CAUSED CRASH:", rawOutlineResponseForDebug);
-            
-            dispatch({
-                type: 'UPDATE_STATUS',
-                // @ts-ignore
-                payload: {
-                    id: item.id,
-                    status: 'error',
-                    statusText: `FATAL: ${error.message.substring(0, 150)}...`,
-                    rawResponse: rawOutlineResponseForDebug || 'Raw response not available.'
-                }
-            });
+            if (error instanceof ContentTooShortError) {
+                const partialContent: GeneratedContent = normalizeGeneratedContent({
+                    ...(processedContent || {}), 
+                    title: item.title,
+                    content: error.content, 
+                }, item.title);
+
+                dispatch({
+                    type: 'SET_CONTENT',
+                    payload: { id: item.id, content: partialContent }
+                });
+                dispatch({
+                    type: 'UPDATE_STATUS',
+                    payload: { id: item.id, status: 'error', statusText: `Content too short (${error.wordCount} words). Review required.` }
+                });
+            } else {
+                 dispatch({
+                    type: 'UPDATE_STATUS',
+                    payload: { id: item.id, status: 'error', statusText: `Error: ${error.message.substring(0, 100)}` }
+                });
+            }
         } finally {
-            stopGenerationRef.current.delete(item.id);
+             stopGenerationRef.current.delete(item.id);
         }
     }, [callAI, existingPages, apiKeys.serperApiKey, apiKeyStatus.serper, wpConfig, siteInfo, geoTargeting, generateImageWithFallback]);
 
@@ -4694,25 +4753,31 @@ const publishItem = async (
                         body: blob
                     });
 
+                    // --- NEW SOTA ERROR DIAGNOSTICS ---
                     if (!mediaResponse.ok) {
+                        // This block now captures the TRUE error message from the server.
                         const errorText = await mediaResponse.text();
                         let errorMessage = `Server responded with status ${mediaResponse.status}.`;
                         
+                        // Try to parse as JSON, but fall back to raw text if it fails (e.g., HTML from a security plugin).
                         try {
                             const errorJson = JSON.parse(errorText);
                             errorMessage = errorJson.message || JSON.stringify(errorJson);
                         } catch (e) {
+                            // This is the key fix: It captures non-JSON errors.
                              const strippedError = errorText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
                              errorMessage = `A server-side error occurred. The response was not valid JSON, which often indicates a security plugin (like Wordfence) or firewall is blocking the request. Server response snippet: "${strippedError.substring(0, 150)}..."`;
                         }
                         throw new Error(errorMessage);
                     }
+                    // --- END OF NEW DIAGNOSTICS ---
 
                     const mediaData = await mediaResponse.json();
                     content = content.replace(new RegExp(escapeRegExp(image.generatedImageSrc), 'g'), mediaData.source_url);
                 }
             }
         } catch (error: any) {
+             // The error message passed here will now be highly specific and helpful.
              return { success: false, message: `Image upload failed: ${error.message}` };
         }
 
@@ -4720,7 +4785,7 @@ const publishItem = async (
         const postData: any = {
             title,
             content,
-            status: isUpdate ? 'publish' : status,
+            status: isUpdate ? 'publish' : status, // Updates should always be published.
             slug,
             meta: {
                 _yoast_wpseo_title: title,
@@ -4739,7 +4804,7 @@ const publishItem = async (
                 if (posts.length > 0) {
                     const postId = posts[0].id;
                     endpoint = `${wpConfig.url}/wp-json/wp/v2/posts/${postId}`;
-                    method = 'POST';
+                    method = 'POST'; // WordPress uses POST for updates on specific ID endpoints
                 } else {
                     console.warn(`Could not find post with slug "${slug}" to update. A new post will be created instead.`);
                 }
@@ -4824,7 +4889,7 @@ const publishItem = async (
             <main className="main-content">
                 {activeView === 'setup' && <SetupView {...{ apiKeys, apiKeyStatus, handleApiKeyChange, editingApiKey, setEditingApiKey, selectedModel, setSelectedModel, selectedGroqModel, setSelectedGroqModel, openrouterModels, handleOpenrouterModelsChange, useGoogleSearch, setUseGoogleSearch, wpConfig, setWpConfig, wpPassword, setWpPassword, siteInfo, setSiteInfo, geoTargeting, setGeoTargeting }} />}
                 {activeView === 'strategy' && <StrategyView {...{ contentMode, setContentMode, topic, setTopic, primaryKeywords, setPrimaryKeywords, sitemapUrl, setSitemapUrl, isCrawling, crawlMessage, existingPages, hubSearchFilter, setHubSearchFilter, hubStatusFilter, setHubStatusFilter, hubSortConfig, handleHubSort, isAnalyzingHealth, healthAnalysisProgress, selectedHubPages, handleToggleHubPageSelect, handleToggleHubPageSelectAll, handleAnalyzeSelectedPages, analyzableForRewrite, handleRewriteSelected, handleOptimizeLinksSelected, setViewingAnalysis, handleCrawlSitemap, isGenerating, handleGenerateClusterPlan, handleGenerateMultipleFromKeywords, imagePrompt, setImagePrompt, numImages, setNumImages, aspectRatio, setAspectRatio, isGeneratingImages, imageGenerationError, generatedImages, handleGenerateImages, handleDownloadImage, addToast, filteredAndSortedHubPages, keywordTopic, setKeywordTopic, handleFindKeywords, isFindingKeywords, keywordStatusText, keywordResults, handleAddKeywordsToQueue }} />}
-                {activeView === 'review' && <ReviewView {...{ items, filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }} />}
+                {activeView === 'review' && <ReviewView {...{ filter, setFilter, isGenerating, selectedItems, handleGenerateSelected, items, handleToggleSelect, handleToggleSelectAll, filteredAndSortedItems, handleSort, setSelectedItemForReview, handleGenerateSingle, handleStopGeneration, generationProgress, setIsBulkPublishModalOpen }} />}
 
                 {selectedItemForReview && (
                     <ReviewModal
