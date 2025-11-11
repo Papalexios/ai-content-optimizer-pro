@@ -609,55 +609,24 @@ const fetchWithProxies = async (
  * @throws {Error} if the connection fails.
  */
 const fetchWordPressWithRetry = async (targetUrl: string, options: RequestInit): Promise<Response> => {
-    const REQUEST_TIMEOUT = 30000;
+    const REQUEST_TIMEOUT = 30000; // 30 seconds for potentially large uploads
     const hasAuthHeader = options.headers && (options.headers as Headers).has('Authorization');
 
-    // For authenticated requests, we MUST be direct - proxies strip auth headers
+    // If the request has an Authorization header, it MUST be a direct request.
+    // Proxies will strip authentication headers and cause a guaranteed failure.
     if (hasAuthHeader) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-        
         try {
-            // Clone headers to avoid modifying original
-            const fetchOptions = {
-                ...options,
-                signal: controller.signal,
-                mode: 'cors', // Explicitly set CORS mode
-                credentials: 'include' // Include credentials for cross-origin
-            };
-            
-            const directResponse = await fetch(targetUrl, fetchOptions);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+            const directResponse = await fetch(targetUrl, { ...options, signal: controller.signal });
             clearTimeout(timeoutId);
-            
-            // Check for CORS errors disguised as network errors
-            if (directResponse.type === 'opaque') {
-                throw new Error('CORS policy blocked the request. Check your .htaccess configuration.');
-            }
-            
-            return directResponse;
+            return directResponse; // Return the response directly, regardless of status, to be handled by the caller.
         } catch (error: any) {
-            clearTimeout(timeoutId);
-            
-            // Enhanced error detection
             if (error.name === 'AbortError') {
-                throw new Error("WordPress API request timed out after 30 seconds.");
+                throw new Error("WordPress API request timed out.");
             }
-            
-            // TypeError often indicates CORS failure
-            if (error.name === 'TypeError' && error.message.includes('fetch')) {
-                throw new Error(`
-                    CORS or Network Error: Cannot connect to WordPress API at ${targetUrl}
-                    
-                    Diagnostic Steps:
-                    1. Open browser DevTools (F12) → Network tab
-                    2. Look for red failed requests
-                    3. Check Console for CORS errors
-                    4. Verify your .htaccess is loaded (check server response headers)
-                    5. Ensure WordPress REST API is enabled
-                    
-                    Quick Test: Try accessing ${targetUrl} in a new browser tab.
-                `);
-            }
+            // A TypeError is the classic sign of a CORS error on a failed fetch.
+            // This will be caught and diagnosed by the calling function (e.g., verifyWpConnection)
             throw error;
         }
     }
@@ -3632,68 +3601,37 @@ const App = () => {
     };
 
     const generateImageWithFallback = useCallback(async (prompt: string): Promise<string | null> => {
-    const timeoutMs = 30000; // 30 second timeout
-    
-    const withTimeout = (promise: Promise<any>, provider: string) => {
-        return Promise.race([
-            promise,
-            new Promise((_, reject) => 
-                setTimeout(() => reject(new Error(`${provider} image generation timed out after ${timeoutMs}ms`)), timeoutMs)
-            )
-        ]);
-    };
-
-    if (apiClients.openai && apiKeyStatus.openai === 'valid') {
-        try {
-            console.log("[Image] Attempting OpenAI DALL-E 3...");
-            const openaiImgResponse = await withTimeout(
-                callAiWithRetry(() => apiClients.openai!.images.generate({ 
-                    model: AI_MODELS.OPENAI_DALLE3, 
-                    prompt, 
-                    n: 1, 
-                    size: '1792x1024', 
-                    response_format: 'b64_json' 
-                })),
-                'OpenAI'
-            );
-            const base64Image = openaiImgResponse.data[0].b64_json;
-            if (base64Image) {
-                console.log("[Image] OpenAI success!");
-                return `data:image/png;base64,${base64Image}`;
+        if (apiClients.openai && apiKeyStatus.openai === 'valid') {
+            try {
+                console.log("Attempting image generation with OpenAI DALL-E 3...");
+                const openaiImgResponse = await callAiWithRetry(() => apiClients.openai!.images.generate({ model: AI_MODELS.OPENAI_DALLE3, prompt, n: 1, size: '1792x1024', response_format: 'b64_json' }));
+                const base64Image = openaiImgResponse.data[0].b64_json;
+                if (base64Image) {
+                    console.log("OpenAI image generation successful.");
+                    return `data:image/png;base64,${base64Image}`;
+                }
+            } catch (error: any) {
+                console.warn("OpenAI image generation failed, falling back to Gemini.", error);
             }
-        } catch (error: any) {
-            console.warn("[Image] OpenAI failed:", error.message);
         }
-    }
 
-    if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
-        try {
-            console.log("[Image] Attempting Gemini Imagen...");
-            const geminiImgResponse = await withTimeout(
-                callAiWithRetry(() => apiClients.gemini!.models.generateImages({ 
-                    model: AI_MODELS.GEMINI_IMAGEN, 
-                    prompt, 
-                    config: { 
-                        numberOfImages: 1, 
-                        outputMimeType: 'image/jpeg', 
-                        aspectRatio: '16:9' 
-                    } 
-                })),
-                'Gemini'
-            );
-            const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
-            if (base64Image) {
-                console.log("[Image] Gemini success!");
-                return `data:image/jpeg;base64,${base64Image}`;
+        if (apiClients.gemini && apiKeyStatus.gemini === 'valid') {
+            try {
+                 console.log("Attempting image generation with Google Gemini Imagen...");
+                 const geminiImgResponse = await callAiWithRetry(() => apiClients.gemini!.models.generateImages({ model: AI_MODELS.GEMINI_IMAGEN, prompt: prompt, config: { numberOfImages: 1, outputMimeType: 'image/jpeg', aspectRatio: '16:9' } }));
+                 const base64Image = geminiImgResponse.generatedImages[0].image.imageBytes;
+                 if (base64Image) {
+                    console.log("Gemini image generation successful.");
+                    return `data:image/jpeg;base64,${base64Image}`;
+                 }
+            } catch (error: any) {
+                 console.error("Gemini image generation also failed.", error);
             }
-        } catch (error: any) {
-            console.error("[Image] Gemini failed:", error.message);
         }
-    }
-    
-    console.error("[Image] All image generation services failed or are unavailable.");
-    return null;
-}, [apiClients, apiKeyStatus]);
+        
+        console.error("All image generation services failed or are unavailable.");
+        return null;
+    }, [apiClients, apiKeyStatus]);
 
     /**
  * Converts a base64 image to WebP format using canvas
@@ -3702,18 +3640,12 @@ const App = () => {
  */
 const convertToWebP = (base64Data: string): Promise<{ blob: Blob; mimeType: string }> => {
     return new Promise((resolve, reject) => {
-        const timeoutMs = 10000; // 10 second timeout
-        const timeoutId = setTimeout(() => {
-            reject(new Error('WebP conversion timed out'));
-        }, timeoutMs);
-
         const img = new Image();
         
         img.onload = () => {
-            clearTimeout(timeoutId);
             const canvas = document.createElement('canvas');
-            canvas.width = Math.min(img.width, 2048); // Cap size for performance
-            canvas.height = Math.min(img.height, 2048);
+            canvas.width = img.width;
+            canvas.height = img.height;
             
             const ctx = canvas.getContext('2d');
             if (!ctx) {
@@ -3721,7 +3653,7 @@ const convertToWebP = (base64Data: string): Promise<{ blob: Blob; mimeType: stri
                 return;
             }
             
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0);
             
             canvas.toBlob(
                 (blob) => {
@@ -3732,13 +3664,12 @@ const convertToWebP = (base64Data: string): Promise<{ blob: Blob; mimeType: stri
                     resolve({ blob, mimeType: 'image/webp' });
                 },
                 'image/webp',
-                0.85 // Slightly reduced quality for faster processing
+                0.9 // Quality setting (0.0 to 1.0)
             );
         };
         
-        img.onerror = (e) => {
-            clearTimeout(timeoutId);
-            reject(new Error(`Failed to load image for conversion: ${e}`));
+        img.onerror = () => {
+            reject(new Error('Failed to load image for conversion'));
         };
         
         img.src = base64Data;
@@ -4387,35 +4318,42 @@ if (references && references.length >= 5) {
                     }
                 }
 
-finalContent = contentParts.join('\n\n');
+                // ✅ FIX: Build complete content FIRST, then process images
+let finalContent = contentParts.join('\n\n');
 
-// ✅ FIX: Check stop signal before starting images
-if (stopGenerationRef.current.has(item.id)) {
-    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'idle', statusText: 'Stopped by user before images' } });
-    continue;
-}
-
-dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 4/5: Processing ${updatedImageDetails.length} images...` } });
+dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: 'Stage 4/5: Generating & Inserting Images...' } });
 
 // ✅ FIX: Declare keywordSlug HERE, outside the Promise.all
 const keywordSlug = metaAndOutline.primaryKeyword.toLowerCase().replace(/\s+/g, '-');
 
-// ✅ FIX: Process images sequentially with progress updates
-for (let i = 0; i < updatedImageDetails.length; i++) {
-    // Check stop signal at each iteration
-    if (stopGenerationRef.current.has(item.id)) {
-        dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'idle', statusText: 'Stopped by user during images' } });
-        break;
-    }
+// ✅ FIX: Process images AFTER finalContent is built
+const updatedImageDetails = await Promise.all(
+    metaAndOutline.imageDetails.map(async (detail, index) => {
+        const geoPrefix = geoTargeting.enabled ? `${geoTargeting.location} ` : '';
+        const semanticKeywordsString = metaAndOutline.semanticKeywords.slice(0, 5).join(', ');
+        
+        const seoTitle = `${geoPrefix}${metaAndOutline.primaryKeyword} - ${index === 0 ? 'Featured' : 'Guide'} Image ${index + 1}`.substring(0, 100);
+        const semanticAltText = `${geoPrefix}${metaAndOutline.primaryKeyword}: ${detail.altText} | ${semanticKeywordsString}`.substring(0, 125);
+        
+        return {
+            ...detail,
+            title: seoTitle,
+            altText: semanticAltText,
+            prompt: `${detail.prompt} | ${geoPrefix} | Keywords: ${semanticKeywordsString}`
+        };
+    })
+);
 
+// ✅ FIX: Process each image and modify finalContent directly
+for (let i = 0; i < updatedImageDetails.length; i++) {
+    if (stopGenerationRef.current.has(item.id)) break;
+    
     const imageDetail = updatedImageDetails[i];
     const placeholderKey = `[IMAGE_${i + 1}_PLACEHOLDER]`;
     
-    // ✅ FIX: Update progress for each image
-    dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 4/5: Processing image ${i + 1} of ${updatedImageDetails.length}...` } });
-    
+    // ✅ FIX: Always generate image, even if placeholder is missing
     try {
-        console.log(`[Image] Generating image ${i + 1}/${updatedImageDetails.length}...`);
+        console.log(`[Image] Generating image ${i + 1}/${updatedImageDetails.length}`);
         
         const generatedImageSrc = await generateImageWithFallback(imageDetail.prompt);
         
@@ -4423,15 +4361,17 @@ for (let i = 0; i < updatedImageDetails.length; i++) {
             imageDetail.generatedImageSrc = generatedImageSrc;
             
             // Convert to WebP
-            console.log(`[Image] Converting to WebP...`);
             const { blob: webpBlob, mimeType: webpMimeType } = await convertToWebP(generatedImageSrc);
             
-            // Upload logic...
+            // ✅ FIX: Upload and get WordPress URL
             let imageHtml = '';
             if (wpConfig.url && wpConfig.username && wpPassword) {
                 try {
                     const uploadUrl = `${wpConfig.url.replace(/\/+$/, '')}/wp-json/wp/v2/media`;
-                    console.log(`[Image] Uploading to WordPress...`);
+                    
+                    // ✅ FIX: Add debug logging
+                    console.log(`[Image Upload] Uploading to: ${uploadUrl}`);
+                    console.log(`[Image Upload] Filename: ${keywordSlug}-image-${i + 1}.webp`);
                     
                     const uploadResponse = await fetchWordPressWithRetry(uploadUrl, {
                         method: 'POST',
@@ -4455,7 +4395,7 @@ for (let i = 0; i < updatedImageDetails.length; i++) {
                                  loading="lazy" />
                             <figcaption>${imageDetail.altText}</figcaption>
                         </figure>`;
-                        console.log(`[Image] Upload success: ${mediaData.source_url}`);
+                        console.log(`[Image Upload] SUCCESS: ${mediaData.source_url}`);
                     } else {
                         const errorData = await uploadResponse.json().catch(() => ({ message: 'Unknown error' }));
                         throw new Error(`WordPress upload failed: ${uploadResponse.status} - ${errorData.message}`);
@@ -4503,9 +4443,6 @@ for (let i = 0; i < updatedImageDetails.length; i++) {
     } catch (imgError) {
         console.error(`[Image] Critical error for ${placeholderKey}:`, imgError);
         finalContent = finalContent.replace(placeholderKey, '');
-        
-        // ✅ FIX: Continue even if one image fails
-        dispatch({ type: 'UPDATE_STATUS', payload: { id: item.id, status: 'generating', statusText: `Stage 4/5: Image ${i + 1} failed, continuing...` } });
     }
 }
 
@@ -4514,7 +4451,6 @@ finalContent = finalContent.replace(/\[IMAGE_\d_PLACEHOLDER\]/g, '');
 
 // ✅ DEBUG: Verify images are in content
 console.log(`[DEBUG] FINAL CONTENT HAS ${(finalContent.match(/<img/g) || []).length} IMAGES`);
-
 
 // Continue with final processing...
 // (The rest of your code should use 'finalContent' directly)
@@ -4594,90 +4530,8 @@ const publishItemToWordPress = async (
         return { success: false, message: 'No content to publish.' };
     }
 
-    // ✅ ENHANCED: Detailed connection tester
-    const testWpConnection = async () => {
-        const cleanUrl = wpConfig.url.replace(/\/+$/, '');
-        const testUrl = `${cleanUrl}/wp-json/wp/v2/posts`;
-        
-        console.log(`🌐 Testing connection to: ${testUrl}`);
-        console.log(`👤 Username: ${wpConfig.username}`);
-        
-        try {
-            // First test: Can we reach the site at all?
-            const corsTest = await fetch(cleanUrl, { 
-                method: 'HEAD', 
-                mode: 'cors',
-                cache: 'no-cache'
-            });
-            
-            if (!corsTest.ok) {
-                console.warn(`⚠️ Site returned ${corsTest.status}`);
-            }
-            
-            // Second test: Can we access the REST API?
-            const response = await fetch(testUrl, {
-                method: 'HEAD',
-                mode: 'cors', // Explicitly set CORS mode
-                cache: 'no-cache',
-                headers: { 
-                    'Authorization': `Basic ${btoa(unescape(encodeURIComponent(`${wpConfig.username}:${currentWpPassword}`)))}` 
-                }
-            });
-            
-            console.log(`✅ API Access: ${response.status} ${response.statusText}`);
-            return response.ok;
-        } catch (error: any) {
-            console.error('❌ CONNECTION FAILED:', error);
-            
-            // ✅ SMART ERROR DETECTION
-            if (error.message.includes('Failed to fetch')) {
-                console.error('🔥 This is a CORS or Network error!');
-                console.error('📋 Diagnostic info:');
-                console.error(`   - WordPress URL: ${wpConfig.url}`);
-                console.error(`   - Attempted to reach: ${cleanUrl}/wp-json/`);
-                console.error(`   - Browser blocked due to: ${error.message}`);
-            }
-            
-            return false;
-        }
-    };
-
-    // ✅ Run connection test with detailed feedback
-    const isConnected = await testWpConnection();
-    if (!isConnected) {
-        return { 
-            success: false, 
-            message: (
-                <div className="connection-error">
-                    <h4>❌ Cannot Connect to WordPress</h4>
-                    <p>This is a <strong>network-level failure</strong> - your browser cannot reach your WordPress site.</p>
-                    
-                    <h5>🔍 Diagnostic Steps:</h5>
-                    <ol>
-                        <li><strong>Check URL:</strong> Open your browser console (F12) and look for CORS errors</li>
-                        <li><strong>Test Direct Access:</strong> Try accessing: <code>{wpConfig.url}/wp-json/</code> in a new tab</li>
-                        <li><strong>Check Permalinks:</strong> WordPress Settings → Permalinks → Must be "Post name"</li>
-                        <li><strong>Disable Security:</strong> Temporarily disable Wordfence/Cloudflare</li>
-                        <li><strong>SSL Check:</strong> If using https://, certificate must be valid</li>
-                    </ol>
-                    
-                    <h5>🛠️ Quick Fixes:</h5>
-                    <ul>
-                        <li>Add this to your <code>.htaccess</code>: 
-                            <pre>Header set Access-Control-Allow-Origin "*"</pre>
-                        </li>
-                        <li>Or install WordPress plugin: <strong>"WP-CORS"</strong></li>
-                    </ul>
-                    
-                    <p><small>Technical details logged to browser console (F12)</small></p>
-                </div>
-            )
-        };
-    }
-
     let contentWithWpImages = generatedContent.content;
     let featuredImageId: number | null = null;
-
     const base64ImageRegex = /<img[^>]+src="data:image\/(jpeg|png|webp);base64,([^"]+)"[^>]*>/g;
 
     const imagesToUpload = [...contentWithWpImages.matchAll(base64ImageRegex)].map((match, index) => {
